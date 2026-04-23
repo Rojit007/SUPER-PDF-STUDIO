@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PDF Studio v4 — UI Redesign Preview</title>
+<style>
+  :root {
+    --bg: #0e0e17;
+    --panel: #141423;
+    --border: #262638;
+    --fg: #e6e6f0;
+    --muted: #9a9ab8;
+    --dim: #5e5e78;
+    --accent: #ff7b54;
+    --mint: #5ee6d0;
+    --cream: #f7f5f0;
+    --ink: #1f1f2e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: "Inter", "Segoe UI", "SF Pro Text", system-ui, sans-serif; }
+  header { padding: 56px 40px 28px; border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .logo { width: 40px; height: 40px; background: var(--accent); position: relative; flex-shrink:0; }
+  .logo::before { content: ""; position:absolute; inset: 6px 6px auto auto; width:14px; height:22px; background:#1a0f08; }
+  .logo::after { content:""; position:absolute; right:6px; bottom:6px; width:8px; height:8px; background:var(--mint); }
+  h1 { font-family: "Space Grotesk", "Inter", sans-serif; font-size: 36px; margin: 0; letter-spacing: -0.02em; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; margin-top: 6px; font-family: "JetBrains Mono", ui-monospace, monospace; }
+  main { max-width: 1480px; margin: 0 auto; padding: 40px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 10px; margin: 28px 0 20px; }
+  .chip { border: 1px solid var(--border); padding: 6px 14px; border-radius: 999px;
+    font-size: 12px; color: var(--muted); font-family: "JetBrains Mono", monospace; }
+  .chip.accent { color: var(--accent); border-color: var(--accent); }
+  .chip.mint { color: var(--mint); border-color: var(--mint); }
+  .grid { display: grid; gap: 40px; margin-top: 36px; }
+  figure { margin: 0; border: 1px solid var(--border); background: var(--panel); overflow:hidden; }
+  figcaption { padding: 16px 22px; display:flex; justify-content:space-between; align-items:center;
+    border-bottom: 1px solid var(--border); background: #0b0b13; }
+  figcaption .title { font-family: "Space Grotesk", sans-serif; font-size: 18px; font-weight: 600; }
+  figcaption .kbd { font-family: "JetBrains Mono", monospace; font-size: 11px;
+    color: var(--accent); background: #1f1f33; padding: 4px 10px; border: 1px solid var(--border); }
+  img { display:block; width: 100%; height: auto; }
+  .notes { margin-top: 64px; padding: 32px; border: 1px dashed var(--border); }
+  .notes h2 { font-family: "Space Grotesk", sans-serif; margin: 0 0 14px; font-size: 22px; }
+  .notes ul { margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.8; }
+  .notes code { background: #1f1f33; color: var(--accent); padding: 2px 6px; font-family: "JetBrains Mono", monospace; font-size: 12px; }
+  footer { padding: 40px; border-top: 1px solid var(--border); color: var(--dim);
+    font-family: "JetBrains Mono", monospace; font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo"></div>
+    <div>
+      <h1>PDF <span>Studio</span> v4</h1>
+      <div class="sub">ui redesign · rendered live on xvfb · Feb 2026</div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="chip-row">
+    <span class="chip accent">Tkinter · 8.6</span>
+    <span class="chip">1500 × 950 viewport</span>
+    <span class="chip">Inter / JetBrains Mono / Space Grotesk</span>
+    <span class="chip mint">0 lint errors</span>
+    <span class="chip">14/14 backend hooks implemented</span>
+  </div>
+
+  <div class="grid">
+    <figure>
+      <figcaption>
+        <span class="title">◐  Dark theme  ·  default</span>
+        <span class="kbd">Ctrl+T to toggle</span>
+      </figcaption>
+      <img src="dark.png" alt="PDF Studio v4 — dark theme" />
+    </figure>
+
+    <figure>
+      <figcaption>
+        <span class="title">☀  Light theme  ·  warm cream</span>
+        <span class="kbd">Ctrl+T to toggle</span>
+      </figcaption>
+      <img src="light.png" alt="PDF Studio v4 — light theme" />
+    </figure>
+  </div>
+
+  <section class="notes">
+    <h2>What you're looking at</h2>
+    <ul>
+      <li>Custom titlebar with coral logo badge, filename pill, theme toggle, help button.</li>
+      <li>Native menu bar (<code>File / Edit / Page / Tools / Output / View / Help</code>) styled to match.</li>
+      <li>Grouped pill-button toolbar — FILE · HISTORY · PAGES · ROTATE · TOOLS · BATCH — with tooltips.</li>
+      <li>Sub-toolbar: ⌕ search · RANGE input with ✓ ✕ ⎘ ⌫ ↻ · Odd/Even/All/None · GO TO · thumb size slider.</li>
+      <li>Two-pane layout: scrollable page list · preview canvas with its own zoom toolbar.</li>
+      <li>Page row cards: drag handle (⋮⋮), include dot (●/○), shadow-framed thumbnail, big monospace page number, orientation + rotation chips, PREVIEWING/EXCLUDED badges, 2-row action cluster (↺ ↻ ⎘ ⌫ ▲ ▼ ✎ ▧).</li>
+      <li>Status bar with coral accent stripe, autosave stamp, version badge.</li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  UI/pdf_studio_ui.py · drop-in replacement · zero backend changes required
+</footer>
+</body>
+</html>

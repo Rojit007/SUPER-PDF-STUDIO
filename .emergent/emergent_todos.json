@@ -1,0 +1,34 @@
+[
+  {
+    "content": "Create pdf_studio_common.py to break circular import",
+    "status": "completed"
+  },
+  {
+    "content": "Update pdf_studio.py + pdf_studio_backend.py to import from common",
+    "status": "completed"
+  },
+  {
+    "content": "UI: remove v4 subtitle, bigger PDF Studio wordmark, remove group labels, brighten inputs",
+    "status": "completed"
+  },
+  {
+    "content": "UI: Fix LANDSCAPE badge to consider rotation",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: real show_output_options + ocr_dialog",
+    "status": "completed"
+  },
+  {
+    "content": "Backend: apply annotations/redactions/watermark/headers/page-numbers in _write_pdf via fitz",
+    "status": "completed"
+  },
+  {
+    "content": "Smoke-test: import all modules to verify no circular import",
+    "status": "completed"
+  },
+  {
+    "content": "Copy fixed files into /app + update .spec for Save-to-Github flow",
+    "status": "completed"
+  }
+]
