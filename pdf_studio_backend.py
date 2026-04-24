@@ -243,13 +243,39 @@ class PDFStudioBase:
 
     def _build_ui(self):
         """No-op: PDFStudioUI.__init__ builds all Qt widgets."""
-        self.range_var       = _Var()
-        self.goto_var        = _Var()
-        self.autosave_var    = _Var(value="")
+        self.range_var        = _Var()
+        self.goto_var         = _Var()
+        self.autosave_var     = _Var(value="")
         self.preview_info_var = _Var(value="No page selected")
-        self.zoom_var        = _Var(value="100%")
-        self.thumb_size_var  = self.thumb_size
+        self.zoom_var         = _Var(value="100%")
+        self.thumb_size_var   = self.thumb_size
+
+        # Defer both the menu refresh and signal wiring until after the
+        # full __init__ chain completes (PDFStudioUI builds its widgets last).
+        QTimer.singleShot(0, self._post_init)
+
+    def _post_init(self):
+        """Called once the event loop starts — all __init__ methods done."""
         self._refresh_recent_menu()
+        self._connect_signals()
+
+    def _connect_signals(self):
+        """Wire Qt shell signals → backend handler methods."""
+        if hasattr(self, "page_clicked"):
+            try:
+                self.page_clicked.connect(self._on_card_clicked)
+            except Exception:
+                pass
+        if hasattr(self, "include_changed"):
+            try:
+                self.include_changed.connect(self._on_include_toggled)
+            except Exception:
+                pass
+        if hasattr(self, "pages_reordered"):
+            try:
+                self.pages_reordered.connect(self._rebuild_rows)
+            except Exception:
+                pass
 
     def _bind_keys(self):
         if hasattr(self, "_bind_global_keys"):
@@ -398,7 +424,8 @@ class PDFStudioBase:
             self.selected_pages = {idx}
             self._preview_index = idx
             self._preview_rec = self.pages[idx]
-        # Qt shell also calls _render_preview via super chain
+            if hasattr(self, "_render_preview"):
+                self._render_preview(idx)
 
     def _on_include_toggled(self, idx: int, state: bool):
         self._update_status()
