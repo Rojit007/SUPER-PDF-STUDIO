@@ -130,13 +130,8 @@ class PDFStudio(PDFStudioUI, PDFFeatures, PDFStudioBase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # High-DPI support
-    if hasattr(Qt, "AA_EnableHighDpiScaling"):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-
     app = QApplication(sys.argv)
+    # High-DPI is enabled by default in Qt6; no attribute needed
     app.setApplicationName("PDF Studio")
     app.setOrganizationName("PDFStudio")
 
