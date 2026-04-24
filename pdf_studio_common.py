@@ -13,10 +13,38 @@ import re
 import sys
 from pathlib import Path
 
-import tkinter as tk
 from PIL import Image, ImageDraw
 
 import fitz  # PyMuPDF
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FRAMEWORK-AGNOSTIC VARIABLE PROXIES
+#  Drop-in replacements for tk.IntVar / BooleanVar / StringVar.
+#  The .get()/.set() interface is preserved so all call-sites keep working.
+#  trace_add() is a no-op here; Qt signal wiring is done in the Qt UI layer.
+# ─────────────────────────────────────────────────────────────────────────────
+class _Var:
+    __slots__ = ("_v",)
+
+    def __init__(self, value=None):
+        self._v = value
+
+    def get(self):
+        return self._v
+
+    def set(self, value):
+        self._v = value
+
+    # tkinter compat shims – safe to ignore in Qt context
+    def trace_add(self, *args, **kwargs):
+        pass
+
+    def trace_variable(self, *args, **kwargs):
+        pass
+
+
+_IntVar = _BooleanVar = _StringVar = _Var
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FROZEN / STATE DIR
@@ -259,8 +287,8 @@ class PageRecord:
             orig_orient = "Portrait"
         self.source_path = source_path
         self.source_index = source_index
-        self.orientation = tk.IntVar(value=normalize_rotation(raw, orig_orient))
-        self.included = tk.BooleanVar(value=True)
+        self.orientation = _IntVar(value=normalize_rotation(raw, orig_orient))
+        self.included = _BooleanVar(value=True)
         self.orig_orient = orig_orient
         self.is_blank = is_blank
         self.thumb_img = None
@@ -291,7 +319,7 @@ class PageRecord:
         if seed not in ("Portrait", "Landscape"):
             seed = "Portrait"
         rec = cls(snap["source_path"], snap["source_index"],
-                  tk.StringVar(value=seed),
+                  _StringVar(value=seed),
                   is_blank=snap.get("is_blank", False))
         rec.included.set(snap.get("included", True))
         rec.orig_orient = seed
