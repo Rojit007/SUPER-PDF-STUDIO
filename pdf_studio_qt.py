@@ -114,10 +114,15 @@ def _make_splash(w: int = 520, h: int = 300) -> QPixmap:
 class PDFStudio(PDFStudioUI, PDFFeatures, PDFStudioBase):
     """Concrete application class.
 
-    MRO ensures Qt UI shell methods take priority, the feature mixin
-    sits in the middle, and backend logic fills everything else.
+    Because QMainWindow (a C++ class) sits between PDFStudioUI and
+    PDFStudioBase in the MRO, cooperative super().__init__() stops at
+    QMainWindow and never reaches PDFStudioBase.  We therefore call
+    PDFStudioBase.__init__ explicitly after the Qt widget tree is built.
     """
-    pass
+
+    def __init__(self):
+        PDFStudioUI.__init__(self)      # builds all Qt widgets
+        PDFStudioBase.__init__(self)    # sets up state vars, defers _post_init
 
 
 # ─────────────────────────────────────────────────────────────────────────────
