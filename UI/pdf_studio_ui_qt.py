@@ -707,6 +707,7 @@ class PDFStudioUI(QMainWindow):
         self._selected_idx: int = -1
         self._dark_mode = True
         self._thumb_workers: set = set()   # keeps QThread wrappers alive
+        self._preview_worker = None        # in-flight preview render
 
         self.setWindowTitle("PDF Studio")
         self.setMinimumSize(1100, 660)
@@ -1207,7 +1208,7 @@ class PDFStudioUI(QMainWindow):
     # ── Preview rendering ────────────────────────────────────────────────────
 
     def _render_preview(self, idx: int = -1):
-        """Render page *idx* in the preview panel."""
+        """Show page *idx* in the preview panel without blocking the UI thread."""
         if idx < 0 or not hasattr(self, "pages") or idx >= len(self.pages):
             self._scene.clear()
             self._preview_item = None
@@ -1218,18 +1219,78 @@ class PDFStudioUI(QMainWindow):
         self._selected_idx = idx
         self._preview_label.setText(f"Page {idx + 1}")
 
-        try:
-            from pdf_studio_common import render_page_image_fitz
-            vw = self._preview_view.viewport().width() or 700
-            img = render_page_image_fitz(
-                rec.source_path, rec.source_index,
-                rec.orientation.get(), rec.orig_orient,
-                target_w=max(vw - 40, 400))
-            pix = _pil_to_qpixmap(img)
-        except Exception:
-            pix = QPixmap(400, 565)
-            pix.fill(QColor(C["elevated"]))
+        # Update card selection highlight immediately (fast path)
+        for i, card in enumerate(self._cards):
+            card.set_selected(i == idx)
 
+        vw = self._preview_view.viewport().width() or 700
+        target_w = max(vw - 40, 400)
+        cache_key = (rec.source_path, rec.source_index, target_w,
+                     rec.orientation.get())
+
+        # Serve from cache if available
+        if hasattr(self, "preview_cache") and cache_key in self.preview_cache:
+            self._set_preview_pixmap(self.preview_cache[cache_key])
+            return
+
+        # Show a grey placeholder instantly so the user sees immediate feedback
+        placeholder = QPixmap(target_w, int(target_w * 1.414))
+        placeholder.fill(QColor(C["elevated"]))
+        self._set_preview_pixmap(placeholder)
+
+        # Cancel any in-flight render
+        if self._preview_worker is not None:
+            self._preview_worker.cancel()
+            self._preview_worker = None
+
+        # Start background render
+        class _PreviewWorker(QThread):
+            done = Signal(QPixmap)
+
+            def __init__(self_, r, tw):
+                super().__init__(self)
+                self_._rec = r
+                self_._target_w = tw
+                self_._cancelled = False
+
+            def cancel(self_):
+                self_._cancelled = True
+
+            def run(self_):
+                if self_._cancelled:
+                    return
+                try:
+                    from pdf_studio_common import render_page_image_fitz
+                    img = render_page_image_fitz(
+                        self_._rec.source_path, self_._rec.source_index,
+                        self_._rec.orientation.get(), self_._rec.orig_orient,
+                        target_w=self_._target_w)
+                    if not self_._cancelled:
+                        self_.done.emit(_pil_to_qpixmap(img))
+                except Exception:
+                    pass
+
+        worker = _PreviewWorker(rec, target_w)
+        self._preview_worker = worker
+        self._thumb_workers.add(worker)
+
+        def _on_done(pix: QPixmap):
+            if self._preview_worker is worker:
+                self._preview_worker = None
+                self._set_preview_pixmap(pix)
+                if hasattr(self, "preview_cache"):
+                    self.preview_cache[cache_key] = pix
+
+        def _cleanup():
+            self._thumb_workers.discard(worker)
+            worker.deleteLater()
+
+        worker.done.connect(_on_done)
+        worker.finished.connect(_cleanup)
+        worker.start()
+
+    def _set_preview_pixmap(self, pix: QPixmap):
+        """Update the QGraphicsScene with a new pixmap (must be called on main thread)."""
         self._scene.clear()
         self._preview_item = QGraphicsPixmapItem(pix)
         self._preview_item.setTransformationMode(
@@ -1237,10 +1298,6 @@ class PDFStudioUI(QMainWindow):
         self._scene.addItem(self._preview_item)
         self._scene.setSceneRect(self._preview_item.boundingRect())
         self._zoom_fit()
-
-        # Update card selection highlight
-        for i, card in enumerate(self._cards):
-            card.set_selected(i == idx)
 
     # ── Card event handlers ──────────────────────────────────────────────────
 

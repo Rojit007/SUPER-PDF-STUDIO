@@ -667,27 +667,12 @@ class PDFStudioBase:
         self._refresh_recent_menu()
 
     def _load_pdf(self, path, replace=False, insert_after=None, password=None):
-        """
-        Start loading *path* in a background thread so the UI stays responsive.
-        Encrypted files are detected first on the main thread so we can show
-        the password dialog before spawning the worker.
-        """
-        # Quick encryption check (cheap — just reads the header)
-        try:
-            _probe = PdfReader(path)
-            if _probe.is_encrypted:
-                password = password or simpledialog.askstring(
-                    "Password", f"Enter password for:\n{os.path.basename(path)}",
-                    show="*")
-                if not password:
-                    return
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not read PDF:\n{e}")
-            return
-
+        """Start loading *path* in a background thread so the UI stays responsive."""
         if hasattr(self, "_show_toast"):
-            self._show_toast("Loading…", "info", 60_000)   # long-lived; dismissed on completion
+            self._show_toast("Loading…", "info", 60_000)
+        self._start_pdf_worker(path, password, replace, insert_after)
 
+    def _start_pdf_worker(self, path, password, replace, insert_after):
         worker = _PDFLoadWorker(path, password)
         thread = QThread()
         worker.moveToThread(thread)
@@ -717,7 +702,10 @@ class PDFStudioBase:
             self._show_toast("", "info", 1)
 
         if error == "__needs_password__":
-            messagebox.showerror("Encrypted", "This PDF requires a password.")
+            pwd = simpledialog.askstring(
+                "Password", f"Enter password for:\n{os.path.basename(path)}", show="*")
+            if pwd:
+                self._start_pdf_worker(path, pwd, replace, insert_after)
             return
         if error == "__wrong_password__":
             messagebox.showerror("Wrong password", "Incorrect password — could not open PDF.")
