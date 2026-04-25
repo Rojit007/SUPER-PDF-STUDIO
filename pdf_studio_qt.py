@@ -131,9 +131,10 @@ class PDFStudio(PDFStudioUI, PDFFeatures, PDFStudioBase):
 
 def main():
     app = QApplication(sys.argv)
-    # High-DPI is enabled by default in Qt6; no attribute needed
     app.setApplicationName("PDF Studio")
     app.setOrganizationName("PDFStudio")
+    # Set a baseline font so Qt never falls back to the unset (-1 pt) sentinel
+    app.setFont(QFont("Segoe UI", 10))
 
     # ── Splash ──────────────────────────────────────────────────────────
     splash = QSplashScreen(_make_splash(),
