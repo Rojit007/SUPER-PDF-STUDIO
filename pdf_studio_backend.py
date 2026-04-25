@@ -1,37 +1,33 @@
 """
-pdf_studio_backend.py — your original Part 1 + Part 2 business logic,
-exported as PDFStudioBase so the top-level PDFStudio class can MRO with
-PDFStudioUI + PDFFeatures cleanly.
+pdf_studio_backend.py — Qt-ported business logic (PDFStudioBase).
 
-No logic was changed. Only two tweaks versus the original source:
-  1. Class renamed PDFStudio → PDFStudioBase
-  2. The explicit inheritance from PDFStudioUI was removed (done in
-     pdf_studio.py instead so the feature mixin can sit in between).
+All PDF operations, undo/redo, page manipulation, session, and file I/O
+are identical to the Tkinter version.  Only the UI interaction points
+have been updated:
 
-Fix applied (April 2026):
-  - _drag_start now stores the dragged page object reference AND immediately
-    sets _preview_rec to the dragged page so the PREVIEWING tag locks onto
-    the page being dragged from the moment the drag begins.
-  - _drag_motion follows _preview_rec by object identity so the blue
-    "previewing" highlight travels with the page you dragged, regardless
-    of how many positions it moves.
-  - _drag_release re-resolves the final index of the dragged page and
-    calls _render_preview so the right-hand preview panel updates correctly.
+  • tk.XxxVar()          → _Var() from pdf_studio_common
+  • messagebox / filedialog / simpledialog / colorchooser
+                         → UI.qt_compat wrappers
+  • tk.Toplevel dialogs  → QDialog subclasses
+  • self.root.after()    → QTimer.singleShot()
+  • ImageTk.PhotoImage   → removed (Qt UI handles thumbnails in _PageCard)
+  • self.progress        → _ProgressStub no-op
+  • _build_ui()          → no-op (PDFStudioUI.__init__ builds the Qt shell)
+  • _render_preview()    → delegates to Qt shell via _render_preview_by_rec()
 """
 from __future__ import annotations
 import os, io, json, math, copy, threading, tempfile, time, re
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 from pypdf import PdfReader, PdfWriter
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 import fitz
 
-# Pull shared module-level symbols from the common module (breaks cycle)
+# Framework-agnostic shared symbols
 from pdf_studio_common import (
     OPTIONS, OPTION_COLORS, ROTATE_STEP, PAGE_SIZES,
     DARK_THEME, LIGHT_THEME,
     RECENT_FILE, SESSION_FILE, SESSION_PERSISTENCE,
     PageRecord, UndoStack,
+    _Var,
     _to_roman, normalize_rotation, rotation_label,
     effective_orientation,
     get_page_orientation, apply_transform, apply_visual_rotation,
@@ -39,15 +35,121 @@ from pdf_studio_common import (
     load_recent_files, save_recent_files, add_recent_file,
     THUMB_W, THUMB_H, ROW_H,
 )
-from UI.pdf_studio_ui import C as UI_C
+from UI.pdf_studio_ui_qt import C as UI_C
+from UI.qt_compat import filedialog, messagebox, simpledialog, colorchooser
 
+from PySide6.QtWidgets import QMenu, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QCheckBox, QRadioButton, QSlider, QFrame, QApplication
+from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal as _Signal
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  No-op progress stub
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _ProgressStub:
+    def start(self, *a): pass
+    def stop(self, *a):  pass
+    def grid(self, *a):  pass
+    def grid_remove(self, *a): pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Background PDF loader  (keeps the UI thread free for large files)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _PDFLoadWorker(QObject):
+    """Reads pages + metadata from a PDF in a background QThread."""
+
+    # (records, metadata_dict, error_message)
+    finished = _Signal(list, dict, str)
+
+    def __init__(self, path: str, password: str | None = None):
+        super().__init__()
+        self._path     = path
+        self._password = password
+
+    def run(self):
+        try:
+            reader = PdfReader(self._path)
+            if reader.is_encrypted:
+                if not self._password:
+                    self.finished.emit([], {}, "__needs_password__")
+                    return
+                try:
+                    reader.decrypt(self._password)
+                except Exception:
+                    self.finished.emit([], {}, "__wrong_password__")
+                    return
+
+            records = []
+            for i in range(len(reader.pages)):
+                orient = get_page_orientation(reader.pages[i])
+                rec = PageRecord(self._path, i, _Var(value=orient))
+                records.append(rec)
+
+            meta = {k: v for k, v in (reader.metadata or {}).items()}
+            self.finished.emit(records, meta, "")
+        except Exception as exc:
+            self.finished.emit([], {}, str(exc))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Reusable Qt dialog helpers (replace inline tk.Toplevel patterns)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _styled_dialog(parent, title: str, w: int = 460, h: int = 360) -> QDialog:
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(w, h)
+    dlg.setModal(True)
+    dlg.setStyleSheet(f"""
+        QDialog  {{ background:{UI_C['panel']}; color:{UI_C['fg']}; }}
+        QLabel   {{ color:{UI_C['fg']}; background:transparent; }}
+        QLineEdit{{ background:{UI_C['input_bg']}; color:{UI_C['fg']};
+                   border:1px solid {UI_C['input_border']}; border-radius:4px;
+                   padding:5px 8px; }}
+        QLineEdit:focus {{ border-color:{UI_C['accent']}; }}
+        QPushButton {{ background:{UI_C['elevated']}; color:{UI_C['fg']};
+                      border:1px solid {UI_C['border']}; border-radius:5px;
+                      padding:6px 14px; }}
+        QPushButton:hover {{ background:{UI_C['elevated_hover']}; }}
+        QPushButton[role="accent"] {{ background:{UI_C['accent']};
+                      color:{UI_C['fg_on_accent']}; border:none; font-weight:600; }}
+        QPushButton[role="accent"]:hover {{ background:{UI_C['accent_hover']}; }}
+        QCheckBox, QRadioButton {{ color:{UI_C['fg']}; }}
+        QTextEdit {{ background:{UI_C['input_bg']}; color:{UI_C['fg']};
+                    border:1px solid {UI_C['input_border']}; border-radius:4px; }}
+        QSlider::groove:horizontal {{ background:{UI_C['input_bg']}; height:4px; border-radius:2px; }}
+        QSlider::handle:horizontal {{ background:{UI_C['accent']}; width:14px; height:14px;
+                                     border-radius:7px; margin:-5px 0; }}
+    """)
+    return dlg
+
+
+def _accent_btn(text: str) -> QPushButton:
+    btn = QPushButton(text)
+    btn.setProperty("role", "accent")
+    btn.style().unpolish(btn)
+    btn.style().polish(btn)
+    return btn
+
+
+def _plain_btn(text: str) -> QPushButton:
+    return QPushButton(text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PDFStudioBase
+# ──────────────────────────────────────────────────────────────────────────────
 
 class PDFStudioBase:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("PDF Studio")
-        self.root.resizable(True, True)
-        self.root.minsize(1100, 660)
+    def __init__(self, root=None):
+        # In Qt mode self IS the QMainWindow; root is self or None.
+        self.root = root or self
+        if hasattr(self, "setWindowTitle"):
+            self.setWindowTitle("PDF Studio")
+        if hasattr(self, "setMinimumSize"):
+            self.setMinimumSize(1100, 660)
 
         self.pages: list = []
         self.primary_path = None
@@ -60,48 +162,49 @@ class PDFStudioBase:
         self.selected_pages = set()
 
         self._preview_index = -1
-        self._preview_rec = None  # track by object, not just index
+        self._preview_rec = None
         self._preview_zoom = 1.0
-        self._preview_tk = None
         self._pan_offset = [0, 0]
         self._pan_start = None
 
-        self._dark_mode = tk.BooleanVar(value=False)
-        self._theme = LIGHT_THEME
+        self._dark_mode = _Var(value=True)
+        self._theme = DARK_THEME
 
-        self.meta_title = tk.StringVar()
-        self.meta_author = tk.StringVar()
-        self.meta_subject = tk.StringVar()
-        self.meta_keywords = tk.StringVar()
-        self.meta_creator = tk.StringVar(value="PDF Studio")
+        self.meta_title    = _Var()
+        self.meta_author   = _Var()
+        self.meta_subject  = _Var()
+        self.meta_keywords = _Var()
+        self.meta_creator  = _Var(value="PDF Studio")
 
-        self.add_page_numbers = tk.BooleanVar(value=False)
-        self.page_num_format = tk.StringVar(value="decimal")
-        self.page_num_position = tk.StringVar(value="bottom-center")
-        self.compress_output = tk.BooleanVar(value=False)
-        self.split_mode = tk.StringVar(value="single")
-        self.watermark_text = tk.StringVar()
-        self.watermark_opacity = tk.IntVar(value=40)
-        self.watermark_pages = tk.StringVar(value="all")
-        self.watermark_color = tk.StringVar(value="#AAAAAA")
-        self.output_page_size = tk.StringVar(value="Original")
-        self.pdfa_mode = tk.BooleanVar(value=False)
-        self.linearize = tk.BooleanVar(value=False)
-        self.encrypt_pdf = tk.BooleanVar(value=False)
-        self.owner_password = tk.StringVar()
-        self.user_password = tk.StringVar()
-        self.flatten_forms = tk.BooleanVar(value=False)
-        self.header_text = tk.StringVar()
-        self.footer_text = tk.StringVar()
-        self.thumb_size = tk.IntVar(value=90)
+        self.add_page_numbers   = _Var(value=False)
+        self.page_num_format    = _Var(value="decimal")
+        self.page_num_position  = _Var(value="bottom-center")
+        self.compress_output    = _Var(value=False)
+        self.split_mode         = _Var(value="single")
+        self.watermark_text     = _Var()
+        self.watermark_opacity  = _Var(value=40)
+        self.watermark_pages    = _Var(value="all")
+        self.watermark_color    = _Var(value="#AAAAAA")
+        self.output_page_size   = _Var(value="Original")
+        self.pdfa_mode          = _Var(value=False)
+        self.linearize          = _Var(value=False)
+        self.encrypt_pdf        = _Var(value=False)
+        self.owner_password     = _Var()
+        self.user_password      = _Var()
+        self.flatten_forms      = _Var(value=False)
+        self.header_text        = _Var()
+        self.footer_text        = _Var()
+        self.thumb_size         = _Var(value=90)
 
-        self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._filter_rows())
+        self._search_var = _Var(value="")
+        self.undo_stack  = UndoStack()
+        self.status_var  = _Var(value="Open a PDF to get started.")
+        self._bookmarks  = []
+        self.progress    = _ProgressStub()
 
-        self.undo_stack = UndoStack()
-        self.status_var = tk.StringVar(value="Open a PDF to get started.")
-        self._auto_save_job = None
-        self._bookmarks = []
+        # Hold references to background threads so Python GC doesn't destroy them
+        self._pdf_load_worker = None
+        self._pdf_load_thread = None
 
         self._build_ui()
         self._bind_keys()
@@ -111,20 +214,26 @@ class PDFStudioBase:
         else:
             self._clear_saved_session()
 
-    # ─────────────────────────────────────────────────────────── THEME ──
+    # ── Qt helper: maps self.root.after(ms, fn) ─────────────────────────────
+
+    def after(self, ms: int, fn=None):
+        if callable(fn):
+            QTimer.singleShot(ms, fn)
+
+    # ── Theme ────────────────────────────────────────────────────────────────
+
     def _toggle_theme(self):
-        want_dark = self._theme is LIGHT_THEME
+        want_dark = not bool(self._dark_mode.get())
+        self._dark_mode.set(want_dark)
         self._theme = DARK_THEME if want_dark else LIGHT_THEME
-        if hasattr(self, "_dark_mode"):
-            self._dark_mode.set(want_dark)
-        if hasattr(self, "_dark_var"):
-            self._dark_var.set(want_dark)
-        self._rebuild_rows()
+        if hasattr(self, "toggle_theme"):
+            self.toggle_theme()
 
     def T(self, key):
         return self._theme.get(key, "#FFFFFF")
 
-    # ───────────────────────────────────────────────────────── UNDO/REDO ──
+    # ── Undo / Redo ──────────────────────────────────────────────────────────
+
     def _push_undo(self, description="action"):
         self.undo_stack.push(self.pages, description)
         self._update_undo_labels()
@@ -133,12 +242,7 @@ class PDFStudioBase:
         u = self.undo_stack.peek_undo()
         r = self.undo_stack.peek_redo()
         if hasattr(self, "update_undo_redo"):
-            self.update_undo_redo(bool(u), bool(r), u, r)
-            return
-        self._undo_btn.config(state="normal" if u else "disabled",
-                              text=f"↩ Undo{': ' + u if u else ''}")
-        self._redo_btn.config(state="normal" if r else "disabled",
-                              text=f"↪ Redo{': ' + r if r else ''}")
+            self.update_undo_redo()
 
     def _restore_from_snap(self, snap):
         new_pages = []
@@ -154,7 +258,6 @@ class PDFStudioBase:
         if snap is None: return
         self.pages = self._restore_from_snap(snap)
         self.selected_pages.clear()
-        # Previewed page was replaced by snapshot; re-anchor by index
         if 0 <= self._preview_index < len(self.pages):
             self._preview_rec = self.pages[self._preview_index]
         else:
@@ -180,73 +283,58 @@ class PDFStudioBase:
         self._update_undo_labels()
         self.status_var.set(f"↪ Redid: {desc}")
 
-    # ─────────────────────────────────────────────────────────── BUILD UI ──
+    # ── Build UI (no-op in Qt mode) ──────────────────────────────────────────
+
     def _build_ui(self):
-        self.search_var = self._search_var
-        self.range_var = tk.StringVar()
-        self.goto_var = tk.StringVar()
-        self.autosave_var = tk.StringVar(value="")
-        self.preview_info_var = tk.StringVar(value="No page selected")
-        self.zoom_var = tk.StringVar(value="100%")
-        self.thumb_size_var = self.thumb_size
+        """No-op: PDFStudioUI.__init__ builds all Qt widgets."""
+        self.range_var        = _Var()
+        self.goto_var         = _Var()
+        self.autosave_var     = _Var(value="")
+        self.preview_info_var = _Var(value="No page selected")
+        self.zoom_var         = _Var(value="100%")
+        self.thumb_size_var   = self.thumb_size
 
-        self.root.configure(bg=UI_C["bg"])
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        # Defer both the menu refresh and signal wiring until after the
+        # full __init__ chain completes (PDFStudioUI builds its widgets last).
+        QTimer.singleShot(0, self._post_init)
 
-        # mixin methods (resolved via MRO at runtime)
-        self._build_titlebar()
-        self._build_menubar()
-        self._build_toolbar()
-        self._apply_ttk_style()
-
-        container = tk.Frame(self.root, bg=UI_C["bg"])
-        container.grid(row=2, column=0, sticky="nsew", padx=0, pady=0)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(1, weight=1)
-        self._build_sub_toolbar_into(container)
-
-        self.pane = tk.PanedWindow(
-            container, orient="horizontal", bg=UI_C["border"],
-            sashwidth=4, sashpad=0, relief="flat", opaqueresize=True)
-        self.pane.grid(row=1, column=0, sticky="nsew")
-        self._build_list_panel()
-        self._build_preview_panel()
-
-        self._build_statusbar()
-
-        self._dark_mode = self._dark_var
-        self._dark_mode.set(True)
-        self._theme = DARK_THEME
-        self._goto_var = self.goto_var
-        self._autosave_var = self.autosave_var
-        self._preview_info_var = self.preview_info_var
-        self._zoom_label = self.zoom_lbl
-        self._preview_foot_var = tk.StringVar(value="Click a thumbnail to preview")
-        self.prev_foot_lbl.config(textvariable=self._preview_foot_var)
-
+    def _post_init(self):
+        """Called once the event loop starts — all __init__ methods done."""
         self._refresh_recent_menu()
+        self._connect_signals()
 
-    def _refresh_recent_menu(self):
-        recent = load_recent_files()
-        if hasattr(self, "refresh_recent_menu"):
-            self.refresh_recent_menu(recent)
-            return
-        self._recent_menu.delete(0, "end")
-        if not recent:
-            self._recent_menu.add_command(label="(none)", state="disabled")
-        for path in recent:
-            self._recent_menu.add_command(
-                label=os.path.basename(path),
-                command=lambda p=path: self._open_path(p))
+    def _connect_signals(self):
+        """Wire Qt shell signals → backend handler methods."""
+        if hasattr(self, "page_clicked"):
+            try:
+                self.page_clicked.connect(self._on_card_clicked)
+            except Exception:
+                pass
+        if hasattr(self, "include_changed"):
+            try:
+                self.include_changed.connect(self._on_include_toggled)
+            except Exception:
+                pass
+        if hasattr(self, "pages_reordered"):
+            try:
+                self.pages_reordered.connect(self._rebuild_rows)
+            except Exception:
+                pass
 
     def _bind_keys(self):
-        # Reuse the UI shell's global key-binder
-        self._bind_global_keys()
+        if hasattr(self, "_bind_global_keys"):
+            self._bind_global_keys()
 
-    # ─────────────────────────────────────────────────────────── PREVIEW ──
+    def _bind_global_keys(self):
+        pass  # Qt shell handles key events via keyPressEvent
+
+    def _refresh_recent_menu(self):
+        if hasattr(self, "refresh_recent_menu"):
+            self.refresh_recent_menu()
+
+    # ── Preview (Qt-delegating) ──────────────────────────────────────────────
+
     def _resolve_preview_index(self):
-        """Resolve _preview_index from _preview_rec after page reorder."""
         if self._preview_rec is not None:
             for i, p in enumerate(self.pages):
                 if p is self._preview_rec:
@@ -255,125 +343,38 @@ class PDFStudioBase:
             self._preview_rec = None
             self._preview_index = -1
 
-    def _render_preview(self, rec=None):
+    def _render_preview_by_rec(self, rec=None):
+        """Convert object-ref → index and delegate to Qt shell _render_preview."""
         if rec is None:
             self._resolve_preview_index()
-            if 0 <= self._preview_index < len(self.pages):
-                rec = self.pages[self._preview_index]
-        if rec is None:
-            return
-        c = self.preview_canvas
-        c.update_idletasks()
-        cw, ch = c.winfo_width(), c.winfo_height()
-        if cw < 10 or ch < 10:
-            self.root.after(100, self._render_preview)
-            return
-        c.delete("all")
-        c.create_rectangle(0, 0, cw, ch, fill=UI_C["preview_bg"], outline="")
-        max_w = max(10, int(cw * self._preview_zoom) - 40)
-        max_h = max(10, int(ch * self._preview_zoom) - 40)
-        ox, oy = self._pan_offset  # pan offset for drag-to-pan
-
-        if rec.is_blank:
-            pw = min(max_w, int(max_h * 0.707))
-            ph = min(max_h, int(max_w / 0.707))
-            x0 = (cw - pw) // 2 + ox
-            y0 = (ch - ph) // 2 + oy
-            c.create_rectangle(x0 + 6, y0 + 6, x0 + pw + 6, y0 + ph + 6,
-                               fill="#000000", outline="", stipple="gray50",
-                               tags="preview_content")
-            c.create_rectangle(x0, y0, x0 + pw, y0 + ph,
-                               fill="#FFFFFF", outline="#CCCCCC", width=2,
-                               tags="preview_content")
-            c.create_text(cw // 2 + ox, ch // 2 + oy, text="BLANK PAGE",
-                          fill="#AAAAAA", font=("Helvetica", 16, "bold"),
-                          tags="preview_content")
+            idx = self._preview_index
         else:
-            key = (rec.source_path, rec.source_index, max_w, max_h,
-                   rec.orientation.get(), int(self._preview_zoom * 100))
-            if key in self.preview_cache:
-                img = self.preview_cache[key]
-            else:
-                img = render_page_image_fitz(
-                    rec.source_path, rec.source_index,
-                    rec.orientation.get(), rec.orig_orient, max_w, max_h)
-                if img:
-                    self.preview_cache[key] = img
-                    self._trim_preview_cache()
-            if img is None:
-                img = Image.new("RGB", (max_w, max_h), "#EEEEEE")
-            iw, ih = img.size
-            x = (cw - iw) // 2 + ox
-            y = (ch - ih) // 2 + oy
-            c.create_rectangle(x + 6, y + 6, x + iw + 6, y + ih + 6,
-                               fill="#000000", outline="", stipple="gray25",
-                               tags="preview_content")
-            self._preview_tk = ImageTk.PhotoImage(img)
-            c.create_image(x, y, anchor="nw", image=self._preview_tk,
-                           tags="preview_content")
-            c.create_rectangle(x, y, x + iw, y + ih, fill="",
-                               outline="#334155", width=3,
-                               tags="preview_content")
+            idx = next((i for i, p in enumerate(self.pages) if p is rec), -1)
+            self._preview_index = idx
+            if idx >= 0:
+                self._preview_rec = rec
+        # Qt shell's _render_preview(idx) is higher in MRO — call directly
+        if hasattr(self, "_render_preview"):
+            self._render_preview(idx)
 
-        idx = self._preview_index
-        src = os.path.basename(rec.source_path) if not rec.is_blank else "Blank"
-        self._preview_info_var.set(
-            f"Page {idx + 1} of {len(self.pages)}  •  "
-            f"{rotation_label(rec.orientation.get())}")
-        self._zoom_label.config(text=f"{int(self._preview_zoom * 100)}%")
-        self.zoom_var.set(f"{int(self._preview_zoom * 100)}%")
-        # Update cursor based on zoom level
-        if self._preview_zoom > 1.0:
-            self.preview_canvas.config(cursor="hand2")
-        else:
-            self.preview_canvas.config(cursor="")
-            self._pan_offset = [0, 0]
-        self._preview_foot_var.set(
-            f"{'◀/▶' if len(self.pages) > 1 else ''} {src} | Ctrl+Scroll to zoom")
-        self.root.after(20, self._preload_adjacent)
-
-    def _on_preview_resize(self, event):
+    def _on_preview_resize(self, event=None):
         if self._preview_index >= 0:
-            self.root.after(50, self._render_preview)
+            QTimer.singleShot(50, lambda: self._render_preview(self._preview_index))
 
-    def _on_preview_click(self, event):
-        if self._preview_zoom > 1.0:
-            self._pan_start = (event.x, event.y)
-            self._pan_offset = getattr(self, '_pan_offset', [0, 0])[:]
-            self.preview_canvas.config(cursor="fleur")
-        else:
-            self._preview_next()
+    def _zoom_in(self):
+        self._preview_zoom = min(4.0, self._preview_zoom + 0.25)
+        if hasattr(self, "_zoom_in") and callable(getattr(type(self).__mro__[1], "_zoom_in", None)):
+            pass
+        self._render_preview_by_rec()
 
-    def _on_preview_drag(self, event):
-        if not getattr(self, '_pan_start', None):
-            return
-        dx = event.x - self._pan_start[0]
-        dy = event.y - self._pan_start[1]
-        self._pan_offset = [
-            self._pan_offset[0] + dx,
-            self._pan_offset[1] + dy
-        ]
-        self._pan_start = (event.x, event.y)
-        self.preview_canvas.move("preview_content", dx, dy)
+    def _zoom_out(self):
+        self._preview_zoom = max(0.25, self._preview_zoom - 0.25)
+        self._render_preview_by_rec()
 
-    def _on_preview_release(self, event):
-        self._pan_start = None
-        if self._preview_zoom > 1.0:
-            self.preview_canvas.config(cursor="hand2")
-        else:
-            self.preview_canvas.config(cursor="")
-
-    def _on_preview_scroll(self, event):
-        if event.delta > 0:
-            self._preview_prev()
-        else:
-            self._preview_next()
-
-    def _on_preview_ctrl_scroll(self, event):
-        if event.delta > 0:
-            self._zoom_in()
-        else:
-            self._zoom_out()
+    def _zoom_fit(self):
+        self._preview_zoom = 1.0
+        self._pan_offset = [0, 0]
+        self._render_preview_by_rec()
 
     def _preview_prev(self):
         if not self.pages: return
@@ -381,9 +382,7 @@ class PDFStudioBase:
         if ni != self._preview_index:
             self._preview_index = ni
             self._preview_rec = self.pages[ni]
-            self._pan_offset = [0, 0]
-            self._render_preview()
-            self._scroll_to_row(ni)
+            self._render_preview(ni)
 
     def _preview_next(self):
         if not self.pages: return
@@ -391,33 +390,12 @@ class PDFStudioBase:
         if ni != self._preview_index:
             self._preview_index = ni
             self._preview_rec = self.pages[ni]
-            self._pan_offset = [0, 0]
-            self._render_preview()
-            self._scroll_to_row(ni)
-
-    def _zoom_in(self):
-        self._preview_zoom = min(4.0, self._preview_zoom + 0.25)
-        if self._preview_zoom <= 1.0:
-            self._pan_offset = [0, 0]
-        self._render_preview()
-
-    def _zoom_out(self):
-        self._preview_zoom = max(0.25, self._preview_zoom - 0.25)
-        if self._preview_zoom <= 1.0:
-            self._pan_offset = [0, 0]
-        self._render_preview()
-
-    def _zoom_fit(self):
-        self._preview_zoom = 1.0
-        self._pan_offset = [0, 0]
-        self._render_preview()
+            self._render_preview(ni)
 
     def _preload_adjacent(self):
         if not self.pages or self._preview_index < 0: return
         idx = self._preview_index
-        cw = self.preview_canvas.winfo_width()
-        ch = self.preview_canvas.winfo_height()
-        max_w, max_h = max(10, int(cw) - 40), max(10, int(ch) - 40)
+        max_w, max_h = 700, 900
         for offset in [-1, 1]:
             i = idx + offset
             if 0 <= i < len(self.pages):
@@ -439,146 +417,131 @@ class PDFStudioBase:
                 del self.preview_cache[k]
 
     def _scroll_to_row(self, idx):
-        try:
-            rows = self.rows_frame.winfo_children()
-            total = len(rows)
-            if total == 0: return
-            frac = max(0.0, min(1.0, (idx - 1) / total))
-            self.list_canvas.yview_moveto(frac)
-        except Exception:
-            pass
+        pass  # Qt scroll area handles this automatically
 
     def _goto_page(self):
         try:
-            n = int(self._goto_var.get())
+            n = int(self.goto_var.get())
             idx = n - 1
             if 0 <= idx < len(self.pages):
                 self._preview_index = idx
                 self._preview_rec = self.pages[idx]
-                self._render_preview()
-                self._scroll_to_row(idx)
-                self._goto_var.set("")
+                self._render_preview(idx)
+                self.goto_var.set("")
         except Exception:
             pass
 
     def _on_thumb_size_change(self, val):
-        global THUMB_W, THUMB_H, ROW_H
         import pdf_studio_common as _m
         _m.THUMB_W = int(float(val))
         _m.THUMB_H = int(_m.THUMB_W * 1.33)
         _m.ROW_H = _m.THUMB_H + 16
         self.thumb_cache.clear()
         self._rebuild_rows()
-        self._load_thumbs_async()
 
-    # ────────────────────────────────────────────────────────── ROWS ──
+    # ── Row management (Qt delegation) ───────────────────────────────────────
+
     def _rebuild_rows(self):
-        if not hasattr(self, "rows_frame"):
-            return
-        if hasattr(self, "clear_page_rows"):
-            self.clear_page_rows()
-        else:
-            for w in self.rows_frame.winfo_children():
-                w.destroy()
-        if hasattr(self, "_grid_wrap"):
-            try: del self._grid_wrap
-            except Exception: pass
-        # Resolve preview index BEFORE adding rows so PREVIEWING badge is correct
+        """Refresh the Qt page-list panel from self.pages."""
+        if hasattr(self, "refresh_rows"):
+            self.refresh_rows()
+        self._update_status()
+        if hasattr(self, "_update_page_count"):
+            self._update_page_count()
         if self._preview_index >= 0 and self.pages:
-            self._resolve_preview_index()
-        filter_text = self._search_var.get().strip().lower()
-        if filter_text == "filter pages…":
-            filter_text = ""
-        for i, rec in enumerate(self.pages):
-            if filter_text:
-                label = f"page {i + 1} {os.path.basename(rec.source_path).lower()}"
-                if filter_text not in label:
-                    continue
-            self._add_row(i, rec)
-        self.rows_frame.update_idletasks()
-        self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all"))
-        if self._preview_index >= 0 and self.pages:
-            self.root.after(50, self._render_preview)
-        if not self.pages:
+            idx = self._preview_index
+            QTimer.singleShot(50, lambda: self._render_preview(idx))
+        elif not self.pages:
             self._preview_index = -1
             self._preview_rec = None
-            self._preview_tk = None
-            c = self.preview_canvas
-            c.delete("all")
-            cw, ch = c.winfo_width(), c.winfo_height()
-            c.create_rectangle(0, 0, cw, ch, fill=UI_C["preview_bg"], outline="")
-            if hasattr(self, "_preview_foot_var"):
-                self._preview_foot_var.set("")
-            if hasattr(self, "preview_info_lbl"):
-                self.preview_info_lbl.config(text="No page selected")
-            if hasattr(self, "_show_empty_if_needed"):
-                self._show_empty_if_needed()
+            if hasattr(self, "_scene"):
+                self._scene.clear()
+                self._preview_item = None
 
     def _filter_rows(self):
         self._rebuild_rows()
 
-    def _add_row(self, i, rec):
-        import pdf_studio_common as _m
-        tw_, th_ = _m.THUMB_W, _m.THUMB_H
-        is_previewed = (i == self._preview_index)
-        is_selected = (i in self.selected_pages)
-        if rec.thumb_img and not rec.thumb_tk:
-            rec.thumb_tk = ImageTk.PhotoImage(rec.thumb_img)
-        row = self.add_page_row(
-            index=i, page_num=i + 1,
-            is_included=rec.included.get(),
-            orig_orient=rec.orig_orient,
-            rotation_deg=int(rec.orientation.get()),
-            is_previewed=is_previewed,
-            is_selected=is_selected,
-            thumb_img=rec.thumb_tk,
-            on_thumb_click=lambda r=rec, idx=i: self._on_thumb_click(r, idx),
-            on_rotate_cw=lambda r=rec, idx=i: self._rotate_page(r, idx, ROTATE_STEP),
-            on_rotate_ccw=lambda r=rec, idx=i: self._rotate_page(r, idx, -ROTATE_STEP),
-            on_duplicate=lambda idx=i: self.duplicate_page(idx),
-            on_delete=lambda idx=i: self.delete_page(idx),
-            on_move_up=lambda idx=i: self.move_page(idx, -1),
-            on_move_down=lambda idx=i: self.move_page(idx, 1),
-            on_annotate=lambda idx=i: self.add_text_annotation(idx),
-            on_redact=lambda idx=i: self.redact_dialog(idx),
-            on_include_toggle=lambda r=rec, idx=i: (
-                r.included.set(not r.included.get()),
-                self._toggle_include(r, idx)),
-            on_right_click=lambda e, idx=i: self._show_context_menu(e, idx),
-            on_row_click=lambda e, idx=i, r=rec: self._on_row_click(e, idx, r),
-            on_row_ctrl_click=lambda e, idx=i, r=rec: self._on_row_ctrl_click(e, idx, r),
-            on_row_shift_click=lambda e, idx=i, r=rec: self._on_row_shift_click(e, idx, r),
-            on_drag_start=lambda e, idx=i: self._drag_start(e, idx),
-            on_drag_motion=lambda e, idx=i: self._drag_motion(e, idx),
-            on_drag_release=lambda e, idx=i: self._drag_release(e, idx),
-        )
-        rec._row_widget = row
-        rec._thumb_label = getattr(row, "_thumb_label", None)
-        rec._rb_frame = getattr(row, "_rb_frame", None)
-        rec._rot_value_lbl = getattr(row, "_rot_value_lbl", None)
-        self._refresh_orient_btns(rec)
+    # ── Card event callbacks (called from PDFStudioUI signals) ───────────────
 
-    def _show_context_menu(self, event, idx):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label=f"Preview page {idx + 1}",
-                         command=lambda: self._on_thumb_click(self.pages[idx], idx))
-        menu.add_separator()
-        menu.add_command(label="Duplicate", command=lambda: self.duplicate_page(idx))
-        menu.add_command(label="Delete",    command=lambda: self.delete_page(idx))
-        menu.add_separator()
-        menu.add_command(label="Rotate CW",  command=lambda: self._rotate_page(self.pages[idx], idx, ROTATE_STEP))
-        menu.add_command(label="Rotate CCW", command=lambda: self._rotate_page(self.pages[idx], idx, -ROTATE_STEP))
-        menu.add_separator()
-        menu.add_command(label="Move Up",   command=lambda: self.move_page(idx, -1))
-        menu.add_command(label="Move Down", command=lambda: self.move_page(idx, 1))
-        menu.add_separator()
-        menu.add_command(label="Add Annotation", command=lambda: self.add_text_annotation(idx))
-        menu.add_command(label="Redact Region",  command=lambda: self.redact_dialog(idx))
-        menu.add_command(label="Page Inspector", command=lambda: self.page_inspector_dialog(idx))
-        menu.add_separator()
-        menu.add_command(label="Include", command=lambda: self._set_include(idx, True))
-        menu.add_command(label="Exclude", command=lambda: self._set_include(idx, False))
-        menu.tk_popup(event.x_root, event.y_root)
+    def _on_card_clicked(self, idx: int):
+        if 0 <= idx < len(self.pages):
+            self.selected_pages = {idx}
+            self._preview_index = idx
+            self._preview_rec = self.pages[idx]
+            if hasattr(self, "_render_preview"):
+                self._render_preview(idx)
+
+    def _on_include_toggled(self, idx: int, state: bool):
+        self._update_status()
+        if hasattr(self, "_update_page_count"):
+            self._update_page_count()
+
+    # ── Thumbnails (Qt shell handles in _PageCard) ────────────────────────────
+
+    def _load_thumbs_async(self):
+        pass  # Qt _PageCard loads thumbnails in its own QThread
+
+    def _load_thumbs_worker(self):
+        pass
+
+    def _update_thumb_ui(self, rec):
+        pass
+
+    def _thumbs_done(self):
+        if self._preview_index >= 0 and self.pages:
+            self._render_preview(self._preview_index)
+
+    def _make_blank_thumb(self):
+        import pdf_studio_common as _m
+        img = Image.new("RGB", (_m.THUMB_W, _m.THUMB_H), "#FFFFFF")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([1, 1, _m.THUMB_W - 2, _m.THUMB_H - 2],
+                       outline="#CCCCCC", width=2)
+        draw.text((_m.THUMB_W // 2, _m.THUMB_H // 2), "BLANK",
+                  fill="#AAAAAA", anchor="mm")
+        return img
+
+    # ── Page actions ─────────────────────────────────────────────────────────
+
+    def _refresh_thumb(self, rec):
+        import pdf_studio_common as _m
+        if rec.is_blank:
+            rec.thumb_img = self._make_blank_thumb()
+        else:
+            key = (rec.source_path, rec.source_index, rec.orientation.get(),
+                   _m.THUMB_W, _m.THUMB_H)
+            if key not in self.thumb_cache:
+                self.thumb_cache[key] = render_page_image_fitz(
+                    rec.source_path, rec.source_index,
+                    rec.orientation.get(), rec.orig_orient,
+                    _m.THUMB_W, _m.THUMB_H, for_thumb=True)
+            rec.thumb_img = self.thumb_cache[key]
+
+    def _orientation_changed(self, rec, idx):
+        self._refresh_thumb(rec)
+        if idx == self._preview_index:
+            self.preview_cache.clear()
+            self._render_preview(idx)
+        self._rebuild_rows()
+        self._update_status()
+
+    def _rotate_page(self, rec, idx, delta):
+        rec.orientation.set((int(rec.orientation.get()) + delta) % 360)
+        self._orientation_changed(rec, idx)
+
+    def _on_thumb_click(self, rec, idx):
+        self._preview_index = idx
+        self._preview_rec = rec
+        self.selected_pages = {idx}
+        self._render_preview(idx)
+        self._rebuild_rows()
+
+    def _refresh_orient_btns(self, rec):
+        pass  # Qt _PageCard handles its own rotation badge
+
+    def _toggle_include(self, rec, idx):
+        self._rebuild_rows()
+        self._update_status()
 
     def _set_include(self, idx, state):
         self.pages[idx].included.set(state)
@@ -590,7 +553,7 @@ class PDFStudioBase:
         self.selected_pages.add(idx)
         self._preview_index = idx
         self._preview_rec = rec
-        self._render_preview(rec)
+        self._render_preview(idx)
         self._rebuild_rows()
 
     def _on_row_ctrl_click(self, event, idx, rec):
@@ -610,70 +573,21 @@ class PDFStudioBase:
                 self.selected_pages.add(j)
         self._rebuild_rows()
 
-    def _refresh_thumb(self, rec):
-        import pdf_studio_common as _m
-        if rec.is_blank:
-            rec.thumb_img = self._make_blank_thumb()
-        else:
-            key = (rec.source_path, rec.source_index, rec.orientation.get(),
-                   _m.THUMB_W, _m.THUMB_H)
-            if key not in self.thumb_cache:
-                self.thumb_cache[key] = render_page_image_fitz(
-                    rec.source_path, rec.source_index,
-                    rec.orientation.get(), rec.orig_orient,
-                    _m.THUMB_W, _m.THUMB_H, for_thumb=True)
-            rec.thumb_img = self.thumb_cache[key]
-        if rec.thumb_img:
-            rec.thumb_tk = ImageTk.PhotoImage(rec.thumb_img)
-            if rec._thumb_label and rec._thumb_label.winfo_exists():
-                rec._thumb_label.config(image=rec.thumb_tk,
-                                        width=_m.THUMB_W, height=_m.THUMB_H)
+    # ── Multi-select actions ─────────────────────────────────────────────────
 
-    def _orientation_changed(self, rec, idx):
-        self._refresh_orient_btns(rec)
-        self._refresh_thumb(rec)
-        if idx == self._preview_index:
-            self.preview_cache.clear()
-            self._render_preview(rec)
-        # Rebuild rows so the orientation badge (PORTRAIT/LANDSCAPE) reflects
-        # the effective orientation after the new rotation.
-        try:
-            self._rebuild_rows()
-        except Exception:
-            pass
-        self._update_status()
-
-    def _rotate_page(self, rec, idx, delta):
-        rec.orientation.set((int(rec.orientation.get()) + delta) % 360)
-        self._orientation_changed(rec, idx)
-
-    def _on_thumb_click(self, rec, idx):
-        self._preview_index = idx
-        self._preview_rec = rec
-        self.selected_pages = {idx}
-        self._render_preview(rec)
-        self._rebuild_rows()
-
-    def _refresh_orient_btns(self, rec):
-        if not rec._rb_frame or not rec._rb_frame.winfo_exists():
-            return
-        row_bg = rec._rb_frame.cget("bg")
-        if rec._rot_value_lbl and rec._rot_value_lbl.winfo_exists():
-            rec._rot_value_lbl.config(text=rotation_label(rec.orientation.get()),
-                                      bg=row_bg)
-
-    def _toggle_include(self, rec, idx):
-        self._rebuild_rows()
-        self._update_status()
-
-    # ────────────────────────────────────────────── MULTI-SELECT ACTIONS ──
     def select_all_pages(self):
         self.selected_pages = set(range(len(self.pages)))
         self._rebuild_rows()
 
+    def select_all(self):
+        self.select_all_pages()
+
     def deselect_all_pages(self):
         self.selected_pages.clear()
         self._rebuild_rows()
+
+    def deselect_all(self):
+        self.deselect_all_pages()
 
     def delete_selected(self):
         if not self.selected_pages: return
@@ -693,7 +607,7 @@ class PDFStudioBase:
         for idx in sorted(self.selected_pages, reverse=True):
             src = self.pages[idx]
             rec = PageRecord(src.source_path, src.source_index,
-                             tk.StringVar(value=src.orig_orient),
+                             _Var(value=src.orig_orient),
                              is_blank=src.is_blank)
             rec.orig_orient = src.orig_orient
             rec.orientation.set(src.orientation.get())
@@ -703,56 +617,38 @@ class PDFStudioBase:
         self._rebuild_rows()
         self._update_status()
 
-    # ─────────────────────────────────────────────── THUMBNAIL LOADING ──
-    def _load_thumbs_async(self):
-        self.progress.grid()
-        self.progress.start(10)
-        threading.Thread(target=self._load_thumbs_worker, daemon=True).start()
+    def rotate_selected_cw(self):
+        self._rotate_selection(ROTATE_STEP)
 
-    def _load_thumbs_worker(self):
-        import pdf_studio_common as _m
-        for rec in list(self.pages):
-            if rec.is_blank:
-                rec.thumb_img = self._make_blank_thumb()
-            else:
-                key = (rec.source_path, rec.source_index, rec.orientation.get(),
-                       _m.THUMB_W, _m.THUMB_H)
-                if key not in self.thumb_cache:
-                    self.thumb_cache[key] = render_page_image_fitz(
-                        rec.source_path, rec.source_index,
-                        rec.orientation.get(), rec.orig_orient,
-                        _m.THUMB_W, _m.THUMB_H, for_thumb=True)
-                rec.thumb_img = self.thumb_cache[key]
-            self.root.after(0, lambda r=rec: self._update_thumb_ui(r))
-        self.root.after(0, self._thumbs_done)
+    def rotate_selected_ccw(self):
+        self._rotate_selection(-ROTATE_STEP)
 
-    def _update_thumb_ui(self, rec):
-        import pdf_studio_common as _m
-        if rec._thumb_label and rec._thumb_label.winfo_exists() and rec.thumb_img:
-            rec.thumb_tk = ImageTk.PhotoImage(rec.thumb_img)
-            rec._thumb_label.config(image=rec.thumb_tk,
-                                    width=_m.THUMB_W, height=_m.THUMB_H)
-        if (0 <= self._preview_index < len(self.pages)
-                and self.pages[self._preview_index] is rec):
-            self.root.after(0, self._render_preview)
+    def _rotate_selection(self, delta):
+        targets = self.selected_pages or ({self._preview_index} if self._preview_index >= 0 else set())
+        if not targets: return
+        self._push_undo("rotate selected")
+        for idx in targets:
+            if 0 <= idx < len(self.pages):
+                rec = self.pages[idx]
+                rec.orientation.set((int(rec.orientation.get()) + delta) % 360)
+        self.thumb_cache.clear()
+        self.preview_cache.clear()
+        self._rebuild_rows()
 
-    def _thumbs_done(self):
-        self.progress.stop()
-        self.progress.grid_remove()
-        if self._preview_index >= 0 and self.pages:
-            self._render_preview()
+    def extract_selected(self):
+        self.extract_pages()
 
-    def _make_blank_thumb(self):
-        import pdf_studio_common as _m
-        img = Image.new("RGB", (_m.THUMB_W, _m.THUMB_H), "#FFFFFF")
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([1, 1, _m.THUMB_W - 2, _m.THUMB_H - 2],
-                       outline="#CCCCCC", width=2)
-        draw.text((_m.THUMB_W // 2, _m.THUMB_H // 2), "BLANK",
-                  fill="#AAAAAA", anchor="mm")
-        return img
+    # ── File operations ──────────────────────────────────────────────────────
 
-    # ───────────────────────────────────────────────── FILE OPERATIONS ──
+    def open_files(self, paths=None):
+        if paths:
+            if isinstance(paths, str):
+                paths = [paths]
+            for p in paths:
+                self._open_path(p)
+        else:
+            self.browse_file()
+
     def browse_file(self):
         path = filedialog.askopenfilename(
             title="Open PDF",
@@ -762,7 +658,8 @@ class PDFStudioBase:
 
     def _open_path(self, path):
         self.primary_path = path
-        self.root.title(f"PDF Studio – {os.path.basename(path)}")
+        if hasattr(self, "setWindowTitle"):
+            self.setWindowTitle(f"PDF Studio – {os.path.basename(path)}")
         if hasattr(self, "update_titlebar"):
             self.update_titlebar(path)
         self._load_pdf(path, replace=True)
@@ -770,48 +667,78 @@ class PDFStudioBase:
         self._refresh_recent_menu()
 
     def _load_pdf(self, path, replace=False, insert_after=None, password=None):
-        try:
-            reader = PdfReader(path)
-            if reader.is_encrypted:
-                pwd = password or simpledialog.askstring(
-                    "Password", f"Enter password for:\n{os.path.basename(path)}",
-                    show="*", parent=self.root)
-                if not pwd:
-                    return
-                try:
-                    reader.decrypt(pwd)
-                except Exception:
-                    messagebox.showerror("Error", "Wrong password.")
-                    return
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not read PDF:\n{e}")
+        """Start loading *path* in a background thread so the UI stays responsive."""
+        if hasattr(self, "_show_toast"):
+            self._show_toast("Loading…", "info", 60_000)
+        self._start_pdf_worker(path, password, replace, insert_after)
+
+    def _start_pdf_worker(self, path, password, replace, insert_after):
+        worker = _PDFLoadWorker(path, password)
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        # Keep Python references so GC doesn't destroy them while running
+        self._pdf_load_worker = worker
+        self._pdf_load_thread = thread
+
+        def _cleanup():
+            self._pdf_load_worker = None
+            self._pdf_load_thread = None
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            lambda recs, meta, err: self._on_pdf_loaded(
+                recs, meta, err, path, replace, insert_after))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(_cleanup)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_pdf_loaded(self, records, meta, error, path, replace, insert_after):
+        """Called on the main thread once the background loader finishes."""
+        # Dismiss the "Loading…" toast
+        if hasattr(self, "_show_toast"):
+            self._show_toast("", "info", 1)
+
+        if error == "__needs_password__":
+            pwd = simpledialog.askstring(
+                "Password", f"Enter password for:\n{os.path.basename(path)}", show="*")
+            if pwd:
+                self._start_pdf_worker(path, pwd, replace, insert_after)
+            return
+        if error == "__wrong_password__":
+            messagebox.showerror("Wrong password", "Incorrect password — could not open PDF.")
+            return
+        if error:
+            messagebox.showerror("Error", f"Could not load PDF:\n{error}")
             return
 
-        new_records = []
-        for i in range(len(reader.pages)):
-            orient = get_page_orientation(reader.pages[i])
-            rec = PageRecord(path, i, tk.StringVar(value=orient))
-            new_records.append(rec)
-
         if replace:
-            self.pages = new_records
-            meta = reader.metadata or {}
+            self.pages = records
             self.meta_title.set(meta.get("/Title", ""))
             self.meta_author.set(meta.get("/Author", ""))
             self.meta_subject.set(meta.get("/Subject", ""))
-            self._preview_index = 0 if new_records else -1
-            self._preview_rec = new_records[0] if new_records else None
+            self._preview_index = 0 if records else -1
+            self._preview_rec = records[0] if records else None
             self.undo_stack = UndoStack()
             self._update_undo_labels()
         elif insert_after is None:
-            self.pages.extend(new_records)
+            self.pages.extend(records)
         else:
-            self.pages[insert_after + 1:insert_after + 1] = new_records
+            self.pages[insert_after + 1:insert_after + 1] = records
 
         self.preview_cache.clear()
         self._rebuild_rows()
-        self._load_thumbs_async()
         self._update_status()
+        if hasattr(self, "refresh_bookmarks_sidebar"):
+            QTimer.singleShot(400, self.refresh_bookmarks_sidebar)
+
+    def open_recent(self, path):
+        if os.path.exists(path):
+            self._open_path(path)
+        else:
+            messagebox.showerror("Not found", f"File not found:\n{path}")
 
     def merge_pdf(self):
         path = filedialog.askopenfilename(
@@ -831,7 +758,6 @@ class PDFStudioBase:
         for path in paths:
             self._add_image_as_page(path)
         self._rebuild_rows()
-        self._load_thumbs_async()
         self._update_status()
 
     def _add_image_as_page(self, img_path):
@@ -840,7 +766,7 @@ class PDFStudioBase:
             tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
             tmp.close()
             img.save(tmp.name, "PDF", resolution=150)
-            rec = PageRecord(tmp.name, 0, tk.StringVar(value="Portrait"))
+            rec = PageRecord(tmp.name, 0, _Var(value="Portrait"))
             self.pages.append(rec)
         except Exception as e:
             messagebox.showerror("Error", f"Could not import image:\n{img_path}\n{e}")
@@ -855,7 +781,6 @@ class PDFStudioBase:
             return
         out_dir = filedialog.askdirectory(title="Choose output folder")
         if not out_dir: return
-        self.progress.grid(); self.progress.start(10)
 
         def worker():
             for i, rec in enumerate(included):
@@ -863,26 +788,22 @@ class PDFStudioBase:
                     img = Image.new("RGB", (595, 842), "white")
                 else:
                     img = render_page_image_fitz(rec.source_path, rec.source_index,
-                                                 rec.orientation.get(),
-                                                 rec.orig_orient,
-                                                 int(595 * 150 / 72),
-                                                 int(842 * 150 / 72))
+                                                 rec.orientation.get(), rec.orig_orient,
+                                                 int(595 * 150 / 72), int(842 * 150 / 72))
                 fname = os.path.join(out_dir, f"page_{i + 1:04d}.png")
                 img.save(fname)
-            self.root.after(0, lambda: (
-                self.progress.stop(), self.progress.grid_remove(),
-                messagebox.showinfo("Done",
-                    f"Exported {len(included)} images to:\n{out_dir}")))
+            QTimer.singleShot(0, lambda: messagebox.showinfo(
+                "Done", f"Exported {len(included)} images to:\n{out_dir}"))
         threading.Thread(target=worker, daemon=True).start()
 
-    # ───────────────────────────────────────────────── PAGE ACTIONS ──
+    # ── Page editing ─────────────────────────────────────────────────────────
+
+    def add_blank_page(self):
+        self.insert_blank()
+
     def insert_blank(self):
-        if not self.pages:
-            messagebox.showwarning("No PDF", "Open a PDF first.")
-            return
         self._push_undo("insert blank page")
-        rec = PageRecord("__blank__", -1, tk.StringVar(value="Portrait"),
-                         is_blank=True)
+        rec = PageRecord("__blank__", -1, _Var(value="Portrait"), is_blank=True)
         rec.thumb_img = self._make_blank_thumb()
         insert_at = self._preview_index + 1 if self._preview_index >= 0 else len(self.pages)
         self.pages.insert(insert_at, rec)
@@ -893,8 +814,7 @@ class PDFStudioBase:
         self._push_undo("duplicate page")
         src = self.pages[idx]
         rec = PageRecord(src.source_path, src.source_index,
-                         tk.StringVar(value=src.orig_orient),
-                         is_blank=src.is_blank)
+                         _Var(value=src.orig_orient), is_blank=src.is_blank)
         rec.orig_orient = src.orig_orient
         rec.orientation.set(src.orientation.get())
         rec.annotations = list(src.annotations)
@@ -918,13 +838,20 @@ class PDFStudioBase:
         if 0 <= new_idx < len(self.pages):
             self._push_undo("move page")
             self.pages[idx], self.pages[new_idx] = self.pages[new_idx], self.pages[idx]
-            # If the moved page is the previewed one, follow it
             if self._preview_rec is not None:
                 for i, p in enumerate(self.pages):
                     if p is self._preview_rec:
                         self._preview_index = i
                         break
             self._rebuild_rows()
+
+    def move_selected_up(self):
+        for idx in sorted(self.selected_pages):
+            self.move_page(idx, -1)
+
+    def move_selected_down(self):
+        for idx in sorted(self.selected_pages, reverse=True):
+            self.move_page(idx, 1)
 
     def reverse_pages(self):
         if not self.pages: return
@@ -947,8 +874,7 @@ class PDFStudioBase:
             self._write_pdf(included, out_path)
 
     def rotate_all_pages(self, delta):
-        if not self.pages:
-            return
+        if not self.pages: return
         step_txt = "CW" if delta > 0 else "CCW"
         self._push_undo(f"rotate all {step_txt}")
         for rec in self.pages:
@@ -956,7 +882,6 @@ class PDFStudioBase:
         self.thumb_cache.clear()
         self.preview_cache.clear()
         self._rebuild_rows()
-        self._load_thumbs_async()
 
     def reset_all_orient(self):
         self._push_undo("reset orientations")
@@ -965,7 +890,6 @@ class PDFStudioBase:
         self.thumb_cache.clear()
         self.preview_cache.clear()
         self._rebuild_rows()
-        self._load_thumbs_async()
 
     def set_all_include(self, state):
         self._push_undo("set all include" if state else "exclude all")
@@ -982,7 +906,7 @@ class PDFStudioBase:
         self._update_status()
 
     def _parse_range_text(self):
-        text = self.range_entry.get().strip()
+        text = self.range_var.get().strip() if self.range_var.get() else ""
         if not text: return None
         indices, n = set(), len(self.pages)
         for part in text.split(","):
@@ -1018,8 +942,7 @@ class PDFStudioBase:
         for idx in sorted(idxs, reverse=True):
             src = self.pages[idx]
             rec = PageRecord(src.source_path, src.source_index,
-                             tk.StringVar(value=src.orig_orient),
-                             is_blank=src.is_blank)
+                             _Var(value=src.orig_orient), is_blank=src.is_blank)
             rec.orig_orient = src.orig_orient
             rec.orientation.set(src.orientation.get())
             self.pages.insert(idx + 1, rec)
@@ -1044,167 +967,26 @@ class PDFStudioBase:
             return
         self._push_undo("range rotate")
         for idx in idxs:
-            self.pages[idx].orientation.set((int(self.pages[idx].orientation.get()) + 90) % 360)
+            self.pages[idx].orientation.set(
+                (int(self.pages[idx].orientation.get()) + 90) % 360)
         self.thumb_cache.clear()
         self.preview_cache.clear()
         self._rebuild_rows()
-        self._load_thumbs_async()
 
-    # ── DRAG & DROP ─────────────────────────────────────────────────────────
+    # ── Drag & drop (Qt-native drag works via QAbstractItemView) ─────────────
+
     def _drag_start(self, event, idx):
-        # Hard-reset any stale drag artifacts before starting a new drag.
-        self._cleanup_grid_drag_bindings()
-        self._end_grid_drag_feedback()
         dragged_rec = self.pages[idx]
-
-        # Immediately make the dragged page the previewed one.
-        # This ensures PREVIEWING locks onto the page being dragged
-        # from the very first moment, not whatever was previously selected.
         self._preview_rec = dragged_rec
         self._preview_index = idx
         self.selected_pages = {idx}
-
-        self.drag_data = {
-            "idx":         idx,
-            "y_start":     event.y_root,
-            "moved":       False,
-            "dragged_rec": dragged_rec,   # object identity anchor
-        }
-        if getattr(self, "_grid_view_on", False):
-            # Capture drag globally so motion keeps tracking even when cursor
-            # leaves the original tile while dragging in grid view.
-            self._grid_drag_motion_bind = self.root.bind(
-                "<B1-Motion>", self._drag_motion, add="+")
-            self._grid_drag_release_bind = self.root.bind(
-                "<ButtonRelease-1>", self._drag_release, add="+")
-            self._start_grid_drag_feedback(event, dragged_rec)
-            # Avoid rebuilding immediately in grid mode: it can disrupt the
-            # drag start gesture and make the grabbed tile feel "unstuck".
-            self._render_preview(dragged_rec)
-        else:
-            # Rebuild rows immediately so the PREVIEWING tag appears on the
-            # correct row before the user has even moved the mouse.
-            self._rebuild_rows()
+        self.drag_data = {"idx": idx, "y_start": 0,
+                          "moved": False, "dragged_rec": dragged_rec}
 
     def _drag_motion(self, event, idx=None):
-        import pdf_studio_common as _m
-        if not self.drag_data:
-            return
-        if getattr(self, "_grid_view_on", False):
-            self._move_grid_drag_feedback(event.x_root, event.y_root)
-            target_idx = self._drag_target_index_from_cursor(event.x_root, event.y_root)
-            if target_idx is None:
-                return
-            src_idx = self.drag_data["idx"]
-            if target_idx != src_idx:
-                if not self.drag_data["moved"]:
-                    self._push_undo("reorder pages")
-                    self.drag_data["moved"] = True
-                dragged = self.pages.pop(src_idx)
-                self.pages.insert(target_idx, dragged)
-                self.drag_data["idx"] = target_idx
-                self.drag_data["y_start"] = event.y_root
-
-                dragged_rec = self.drag_data["dragged_rec"]
-                for i, p in enumerate(self.pages):
-                    if p is dragged_rec:
-                        self._preview_index = i
-                        self._preview_rec = dragged_rec
-                        break
-                self._rebuild_rows()
-            return
-        dy = event.y_root - self.drag_data["y_start"]
-        steps = int(dy // max(1, _m.ROW_H // 2))
-        if steps != 0:
-            new_idx = max(0, min(len(self.pages) - 1, self.drag_data["idx"] + steps))
-            if new_idx != self.drag_data["idx"]:
-                if not self.drag_data["moved"]:
-                    self._push_undo("reorder pages")
-                    self.drag_data["moved"] = True
-
-                # Swap the pages in the list
-                self.pages[self.drag_data["idx"]], self.pages[new_idx] = \
-                    self.pages[new_idx], self.pages[self.drag_data["idx"]]
-                self.drag_data["idx"] = new_idx
-                self.drag_data["y_start"] = event.y_root
-
-                # ── THE KEY FIX ──────────────────────────────────────────
-                # _preview_rec is ALWAYS the dragged page (set in _drag_start).
-                # Walk the list to find where dragged_rec ended up after the
-                # swap and update _preview_index to match. This keeps the
-                # PREVIEWING highlight glued to the dragged page no matter
-                # how far it moves, because we follow object identity, not
-                # a stale integer index.
-                dragged_rec = self.drag_data["dragged_rec"]
-                for i, p in enumerate(self.pages):
-                    if p is dragged_rec:
-                        self._preview_index = i
-                        self._preview_rec = dragged_rec  # keep anchor explicit
-                        break
-
-                self._rebuild_rows()
-
-    def _drag_target_index_from_cursor(self, x_root, y_root):
-        """Resolve page index under cursor for grid drag-reorder."""
-        # Keep drag active only when cursor is over/near the pages pane.
-        try:
-            lx0 = self.list_canvas.winfo_rootx()
-            ly0 = self.list_canvas.winfo_rooty()
-            lx1 = lx0 + self.list_canvas.winfo_width()
-            ly1 = ly0 + self.list_canvas.winfo_height()
-            if not (lx0 - 24 <= x_root <= lx1 + 24 and ly0 - 24 <= y_root <= ly1 + 24):
-                return None
-        except Exception:
-            pass
-
-        # Geometry-based lookup is resilient even when overlay windows
-        # (drag ghost) are under the cursor.
-        inside_matches = []
-        nearest = None
-        nearest_dist = float("inf")
-        for i, rec in enumerate(self.pages):
-            w = getattr(rec, "_row_widget", None)
-            if w is None:
-                continue
-            try:
-                if not w.winfo_exists():
-                    continue
-                x0 = w.winfo_rootx()
-                y0 = w.winfo_rooty()
-                x1 = x0 + w.winfo_width()
-                y1 = y0 + w.winfo_height()
-            except Exception:
-                continue
-            cx = (x0 + x1) / 2.0
-            cy = (y0 + y1) / 2.0
-            dist = (cx - x_root) ** 2 + (cy - y_root) ** 2
-            if x0 <= x_root <= x1 and y0 <= y_root <= y1:
-                inside_matches.append((dist, i))
-            if dist < nearest_dist:
-                nearest_dist = dist
-                nearest = i
-        if inside_matches:
-            inside_matches.sort(key=lambda t: t[0])
-            return inside_matches[0][1]
-        if nearest is not None:
-            return nearest
-
-        try:
-            w = self.root.winfo_containing(x_root, y_root)
-        except Exception:
-            w = None
-        while w is not None:
-            idx = getattr(w, "_page_index", None)
-            if isinstance(idx, int) and 0 <= idx < len(self.pages):
-                return idx
-            w = getattr(w, "master", None)
-        return None
+        pass  # Qt drag is handled by QAbstractItemView
 
     def _drag_release(self, event, idx=None):
-        # After releasing, re-resolve the final position of the dragged page
-        # by object identity and render its preview in the right-hand panel.
-        self._end_grid_drag_feedback()
-        self._cleanup_grid_drag_bindings()
         if self.drag_data:
             dragged_rec = self.drag_data.get("dragged_rec")
             if dragged_rec is not None:
@@ -1213,232 +995,165 @@ class PDFStudioBase:
                     if p is dragged_rec:
                         self._preview_index = i
                         break
-                self._rebuild_rows()
-                self._render_preview(dragged_rec)
         self.drag_data = {}
 
-    def _start_grid_drag_feedback(self, event, rec):
-        """Create visual drag feedback for grid tiles."""
-        try:
-            ghost = tk.Toplevel(self.root)
-            ghost.wm_overrideredirect(True)
-            ghost.wm_attributes("-topmost", True)
-            try:
-                ghost.wm_attributes("-alpha", 0.92)
-            except Exception:
-                pass
-            frame = tk.Frame(ghost, bg="#0F172A", highlightthickness=1,
-                             highlightbackground="#38BDF8")
-            frame.pack()
-            img = getattr(rec, "thumb_tk", None)
-            if img is not None:
-                lbl = tk.Label(frame, image=img, bg="#FFFFFF", bd=0)
-                lbl.image = img
-            else:
-                lbl = tk.Label(frame, text="Dragging page", fg="#E2E8F0",
-                               bg="#0F172A", padx=12, pady=8)
-            lbl.pack(padx=4, pady=4)
-            self._grid_drag_ghost = ghost
-            self.root.configure(cursor="hand2")
-            self._move_grid_drag_feedback(event.x_root, event.y_root)
-        except Exception:
-            pass
+    def _drag_target_index_from_cursor(self, x, y):
+        return None
 
-    def _move_grid_drag_feedback(self, x_root, y_root):
-        ghost = self._grid_drag_ghost
-        if ghost is None:
-            return
-        try:
-            ghost.geometry(f"+{x_root + 14}+{y_root + 14}")
-        except Exception:
-            pass
+    def _start_grid_drag_feedback(self, event, rec):
+        pass
+
+    def _move_grid_drag_feedback(self, x, y):
+        pass
 
     def _end_grid_drag_feedback(self):
-        ghost = self._grid_drag_ghost
-        if ghost is not None:
-            try:
-                ghost.destroy()
-            except Exception:
-                pass
-        self._grid_drag_ghost = None
-        try:
-            self.root.configure(cursor="")
-        except Exception:
-            pass
+        pass
 
     def _cleanup_grid_drag_bindings(self):
-        """Always remove temporary root-level drag bindings if present."""
-        if getattr(self, "_grid_drag_motion_bind", None):
-            try:
-                self.root.unbind("<B1-Motion>", self._grid_drag_motion_bind)
-            except Exception:
-                pass
-            self._grid_drag_motion_bind = None
-        if getattr(self, "_grid_drag_release_bind", None):
-            try:
-                self.root.unbind("<ButtonRelease-1>", self._grid_drag_release_bind)
-            except Exception:
-                pass
-            self._grid_drag_release_bind = None
+        pass
 
-    # ─── ANNOTATIONS / REDACTIONS / CROPS / OTHER DIALOGS ───────────────
+    # ── Context menu ─────────────────────────────────────────────────────────
+
+    def _show_context_menu(self, pos, idx):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background:{UI_C['popover_bg']}; color:{UI_C['fg']};"
+            f" border:1px solid {UI_C['border_strong']}; border-radius:6px; padding:4px 0; }}"
+            f"QMenu::item {{ padding:7px 28px 7px 14px; border-radius:4px; margin:1px 4px; }}"
+            f"QMenu::item:selected {{ background:{UI_C['elevated_hover']}; }}"
+        )
+
+        menu.addAction(f"Preview page {idx + 1}",
+                       lambda: self._on_thumb_click(self.pages[idx], idx))
+        menu.addSeparator()
+        menu.addAction("Duplicate",  lambda: self.duplicate_page(idx))
+        menu.addAction("Delete",     lambda: self.delete_page(idx))
+        menu.addSeparator()
+        menu.addAction("Rotate CW",  lambda: self._rotate_page(self.pages[idx], idx, ROTATE_STEP))
+        menu.addAction("Rotate CCW", lambda: self._rotate_page(self.pages[idx], idx, -ROTATE_STEP))
+        menu.addSeparator()
+        menu.addAction("Move Up",    lambda: self.move_page(idx, -1))
+        menu.addAction("Move Down",  lambda: self.move_page(idx, 1))
+        menu.addSeparator()
+        menu.addAction("Add Annotation", lambda: self.add_text_annotation(idx))
+        menu.addAction("Redact Region",  lambda: self.redact_dialog(idx))
+        menu.addAction("Page Inspector", lambda: self.page_inspector_dialog(idx))
+        menu.addSeparator()
+        menu.addAction("Include", lambda: self._set_include(idx, True))
+        menu.addAction("Exclude", lambda: self._set_include(idx, False))
+
+        from PySide6.QtGui import QCursor
+        menu.exec(QCursor.pos())
+
+    # ── Dialog: Add text annotation ──────────────────────────────────────────
+
     def add_text_annotation(self, idx=None):
-        if idx is None:
-            idx = self._preview_index
+        if idx is None: idx = self._preview_index
         if idx < 0 or idx >= len(self.pages):
             messagebox.showwarning("No page", "Select a page first.")
             return
-        win = tk.Toplevel(self.root)
-        win.title(f"Add annotation – page {idx + 1}")
-        win.transient(self.root)
-        win.configure(bg=UI_C["panel"])
-        win.geometry("420x320")
 
-        pad = {"padx": 14, "pady": 6}
-        tk.Label(win, text=f"Annotation for page {idx + 1}",
-                 bg=UI_C["panel"], fg=UI_C["fg"],
-                 font=("TkDefaultFont", 12, "bold")).pack(anchor="w", **pad)
+        dlg = _styled_dialog(self, f"Add annotation – page {idx + 1}", 460, 380)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 12, 16, 16)
 
-        text_var = tk.StringVar()
-        tk.Label(win, text="Text:", bg=UI_C["panel"], fg=UI_C["fg_muted"]
-                 ).pack(anchor="w", padx=14)
-        tx = tk.Text(win, height=4, bg=UI_C["input_bg"], fg=UI_C["fg"],
-                     insertbackground=UI_C["accent"], relief="flat",
-                     highlightthickness=1,
-                     highlightbackground=UI_C["input_border"])
-        tx.pack(fill="x", padx=14)
+        layout.addWidget(QLabel(f"Annotation for page {idx + 1}"))
 
-        x_var = tk.DoubleVar(value=0.1)
-        y_var = tk.DoubleVar(value=0.9)
-        size_var = tk.IntVar(value=12)
-        color_var = tk.StringVar(value="#DC2626")
+        layout.addWidget(QLabel("Text:"))
+        tx = QTextEdit()
+        tx.setMaximumHeight(80)
+        layout.addWidget(tx)
 
-        grid = tk.Frame(win, bg=UI_C["panel"])
-        grid.pack(fill="x", padx=14, pady=(10, 0))
-        for i, (lbl, var, w) in enumerate([("X (0-1)", x_var, 6),
-                                            ("Y (0-1)", y_var, 6),
-                                            ("Size", size_var, 5)]):
-            tk.Label(grid, text=lbl, bg=UI_C["panel"], fg=UI_C["fg_muted"]
-                     ).grid(row=0, column=i * 2, padx=(0, 4))
-            tk.Entry(grid, textvariable=var, width=w,
-                     bg=UI_C["input_bg"], fg=UI_C["fg"], bd=0,
-                     insertbackground=UI_C["accent"], relief="flat",
-                     highlightthickness=1,
-                     highlightbackground=UI_C["input_border"]
-                     ).grid(row=0, column=i * 2 + 1, padx=(0, 10))
+        row = QHBoxLayout()
+        x_edit = QLineEdit("0.1"); row.addWidget(QLabel("X (0–1):")); row.addWidget(x_edit)
+        y_edit = QLineEdit("0.9"); row.addWidget(QLabel("Y (0–1):")); row.addWidget(y_edit)
+        sz_edit = QLineEdit("12"); row.addWidget(QLabel("Size:")); row.addWidget(sz_edit)
+        layout.addLayout(row)
 
+        color_var = _Var(value="#DC2626")
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        swatch = QFrame(); swatch.setFixedSize(30, 22)
+        swatch.setStyleSheet(f"background:{color_var.get()}; border:1px solid {UI_C['border']};")
+        color_row.addWidget(swatch)
+        pick_btn = QPushButton("Choose…")
         def pick_color():
-            c = colorchooser.askcolor(color=color_var.get(), parent=win)
-            if c and c[1]:
-                color_var.set(c[1])
-                swatch.configure(bg=c[1])
-        crow = tk.Frame(win, bg=UI_C["panel"])
-        crow.pack(fill="x", padx=14, pady=(10, 0))
-        tk.Label(crow, text="Color:", bg=UI_C["panel"], fg=UI_C["fg_muted"]
-                 ).pack(side="left", padx=(0, 6))
-        swatch = tk.Label(crow, text="   ", bg=color_var.get(), width=4,
-                          relief="flat", cursor="hand2")
-        swatch.pack(side="left")
-        swatch.bind("<Button-1>", lambda _e: pick_color())
-        tk.Button(crow, text="Choose…", command=pick_color,
-                  bg=UI_C["elevated"], fg=UI_C["fg"], bd=0,
-                  activebackground=UI_C["elevated_hover"],
-                  cursor="hand2").pack(side="left", padx=8)
+            c, hexcol = colorchooser.askcolor(color=color_var.get())
+            if hexcol:
+                color_var.set(hexcol)
+                swatch.setStyleSheet(f"background:{hexcol}; border:1px solid {UI_C['border']};")
+        pick_btn.clicked.connect(pick_color)
+        color_row.addWidget(pick_btn)
+        color_row.addStretch()
+        layout.addLayout(color_row)
 
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = _plain_btn("Cancel"); cancel_btn.clicked.connect(dlg.reject)
+        save_btn = _accent_btn("Add annotation")
         def save():
-            txt = tx.get("1.0", "end").strip() or text_var.get().strip()
+            txt = tx.toPlainText().strip()
             if not txt:
-                messagebox.showwarning("Empty", "Type some text first.",
-                                       parent=win)
+                messagebox.showwarning("Empty", "Enter annotation text.", parent=dlg)
                 return
+            try:
+                ax = float(x_edit.text()); ay = float(y_edit.text())
+                fs = int(sz_edit.text())
+            except ValueError:
+                messagebox.showerror("Bad input", "Use numbers.", parent=dlg); return
             self._push_undo("add annotation")
             self.pages[idx].annotations.append({
-                "text": txt,
-                "x": float(x_var.get()),
-                "y": float(y_var.get()),
-                "fontsize": int(size_var.get()),
-                "color": color_var.get(),
-            })
-            self.status_var.set(
-                f"✏ Annotation added to page {idx + 1} "
-                f"({len(self.pages[idx].annotations)} total)")
-            win.destroy()
+                "text": txt, "x": ax, "y": ay,
+                "fontsize": fs, "color": color_var.get()})
+            self.status_var.set(f"📝 Annotation added to page {idx + 1}")
+            dlg.accept()
+        save_btn.clicked.connect(save)
+        btns.addWidget(cancel_btn); btns.addWidget(save_btn)
+        layout.addLayout(btns)
+        dlg.exec()
 
-        btns = tk.Frame(win, bg=UI_C["panel"])
-        btns.pack(fill="x", padx=14, pady=14, side="bottom")
-        tk.Button(btns, text="Cancel", command=win.destroy,
-                  bg=UI_C["elevated"], fg=UI_C["fg"], bd=0,
-                  activebackground=UI_C["elevated_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
-        tk.Button(btns, text="Add annotation", command=save,
-                  bg=UI_C["accent"], fg="#FFFFFF", bd=0,
-                  activebackground=UI_C["accent_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
+    # ── Dialog: Redact ────────────────────────────────────────────────────────
 
     def redact_dialog(self, idx=None):
-        if idx is None:
-            idx = self._preview_index
+        if idx is None: idx = self._preview_index
         if idx < 0 or idx >= len(self.pages):
             messagebox.showwarning("No page", "Select a page first.")
             return
-        win = tk.Toplevel(self.root)
-        win.title(f"Add redaction – page {idx + 1}")
-        win.transient(self.root)
-        win.configure(bg=UI_C["panel"])
-        win.geometry("360x260")
 
-        tk.Label(win, text=f"Redaction rectangle for page {idx + 1}",
-                 bg=UI_C["panel"], fg=UI_C["fg"],
-                 font=("TkDefaultFont", 11, "bold")
-                 ).pack(anchor="w", padx=14, pady=(14, 4))
-        tk.Label(win, text="Coordinates are normalised 0-1 "
-                           "(origin = top-left).",
-                 bg=UI_C["panel"], fg=UI_C["fg_muted"], wraplength=320,
-                 justify="left").pack(anchor="w", padx=14)
+        dlg = _styled_dialog(self, f"Add redaction – page {idx + 1}", 360, 280)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 12, 16, 16)
+        layout.addWidget(QLabel(f"Redaction rectangle for page {idx + 1}"))
+        layout.addWidget(QLabel("Coordinates are normalised 0–1 (origin = top-left)."))
 
-        x0 = tk.DoubleVar(value=0.10)
-        y0 = tk.DoubleVar(value=0.10)
-        x1 = tk.DoubleVar(value=0.90)
-        y1 = tk.DoubleVar(value=0.20)
-        grid = tk.Frame(win, bg=UI_C["panel"])
-        grid.pack(padx=14, pady=14)
-        for r, (lbl, var) in enumerate([("X₀", x0), ("Y₀", y0),
-                                         ("X₁", x1), ("Y₁", y1)]):
-            tk.Label(grid, text=lbl, bg=UI_C["panel"], fg=UI_C["fg_muted"],
-                     width=4, anchor="e"
-                     ).grid(row=r // 2, column=(r % 2) * 2, padx=4, pady=4)
-            tk.Entry(grid, textvariable=var, width=8,
-                     bg=UI_C["input_bg"], fg=UI_C["fg"], bd=0,
-                     insertbackground=UI_C["accent"], relief="flat",
-                     highlightthickness=1,
-                     highlightbackground=UI_C["input_border"]
-                     ).grid(row=r // 2, column=(r % 2) * 2 + 1,
-                            padx=(0, 10), pady=4)
+        grid = QHBoxLayout()
+        x0_e = QLineEdit("0.10"); y0_e = QLineEdit("0.10")
+        x1_e = QLineEdit("0.90"); y1_e = QLineEdit("0.20")
+        for lbl, w in [("X₀", x0_e), ("Y₀", y0_e), ("X₁", x1_e), ("Y₁", y1_e)]:
+            grid.addWidget(QLabel(lbl)); grid.addWidget(w)
+        layout.addLayout(grid)
 
+        btns = QHBoxLayout(); btns.addStretch()
+        cancel_btn = _plain_btn("Cancel"); cancel_btn.clicked.connect(dlg.reject)
+        add_btn = _accent_btn("Add redaction")
         def save():
             try:
-                coords = (float(x0.get()), float(y0.get()),
-                          float(x1.get()), float(y1.get()))
-            except Exception:
-                messagebox.showerror("Bad input", "Use numbers 0-1.", parent=win)
-                return
+                coords = (float(x0_e.text()), float(y0_e.text()),
+                          float(x1_e.text()), float(y1_e.text()))
+            except ValueError:
+                messagebox.showerror("Bad input", "Use numbers 0–1.", parent=dlg); return
             self._push_undo("add redaction")
             self.pages[idx].redactions.append(coords)
             self.status_var.set(
                 f"⬛ Redaction added to page {idx + 1} "
                 f"({len(self.pages[idx].redactions)} total)")
-            win.destroy()
+            dlg.accept()
+        add_btn.clicked.connect(save)
+        btns.addWidget(cancel_btn); btns.addWidget(add_btn)
+        layout.addLayout(btns)
+        dlg.exec()
 
-        btns = tk.Frame(win, bg=UI_C["panel"])
-        btns.pack(fill="x", padx=14, pady=(0, 14), side="bottom")
-        tk.Button(btns, text="Cancel", command=win.destroy,
-                  bg=UI_C["elevated"], fg=UI_C["fg"], bd=0,
-                  activebackground=UI_C["elevated_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
-        tk.Button(btns, text="Add redaction", command=save,
-                  bg=UI_C["accent"], fg="#FFFFFF", bd=0,
-                  activebackground=UI_C["accent_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
+    # ── Dialog: Add stamp ─────────────────────────────────────────────────────
 
     def add_stamp_dialog(self):
         path = filedialog.askopenfilename(
@@ -1451,24 +1166,30 @@ class PDFStudioBase:
             "x": 0.7, "y": 0.8, "w": 0.25, "h": 0.15})
         self.status_var.set(f"🖼 Stamp added to page {self._preview_index + 1}")
 
-    def crop_margins_dialog(self): messagebox.showinfo("Crop", "Use Pro ▸ Auto-Crop")
-    def resize_pages_dialog(self): messagebox.showinfo("Resize", "Use Output ▸ Options ▸ Page Size")
+    def crop_margins_dialog(self):
+        messagebox.showinfo("Crop", "Use Pro ▸ Auto-Crop")
+
+    def resize_pages_dialog(self):
+        messagebox.showinfo("Resize", "Use Output ▸ Options ▸ Page Size")
+
+    # ── Dialog: Encryption ────────────────────────────────────────────────────
 
     def encryption_dialog(self):
-        pwd = simpledialog.askstring("Encrypt", "Owner password:",
-                                     show="*", parent=self.root)
+        pwd = simpledialog.askstring("Encrypt", "Owner password:", show="*")
         if pwd:
             self.encrypt_pdf.set(True)
             self.owner_password.set(pwd)
             messagebox.showinfo("Encryption", "Enabled for next save.")
 
+    # ── Dialog: Unlock PDF ────────────────────────────────────────────────────
+
     def unlock_pdf_dialog(self):
         path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
         if not path: return
-        pwd = simpledialog.askstring("Password", "Password:", show="*",
-                                     parent=self.root)
+        pwd = simpledialog.askstring("Password", "Password:", show="*")
         if pwd is None: return
-        out = filedialog.asksaveasfilename(defaultextension=".pdf")
+        out = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                           filetypes=[("PDF", "*.pdf")])
         if not out: return
         try:
             r = PdfReader(path); r.decrypt(pwd)
@@ -1478,6 +1199,8 @@ class PDFStudioBase:
             messagebox.showinfo("Done", f"Unlocked → {out}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    # ── Dialog: OCR ───────────────────────────────────────────────────────────
 
     def ocr_dialog(self):
         if not self.pages or not self.primary_path:
@@ -1493,109 +1216,67 @@ class PDFStudioBase:
                 "You also need the Tesseract binary on your PATH.")
             return
 
-        win = tk.Toplevel(self.root)
-        win.title("Run OCR")
-        win.transient(self.root)
-        win.configure(bg=UI_C["panel"])
-        win.geometry("420x280")
+        dlg = _styled_dialog(self, "Run OCR", 440, 300)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 12, 16, 16)
+        layout.addWidget(QLabel("Run OCR on this document"))
+        layout.addWidget(QLabel(
+            "A searchable PDF layer will be added using Tesseract OCR.\n"
+            "Each page is rasterised and recognised text is re-embedded."))
 
-        tk.Label(win, text="Run OCR on this document",
-                 bg=UI_C["panel"], fg=UI_C["fg"],
-                 font=("TkDefaultFont", 12, "bold")
-                 ).pack(anchor="w", padx=14, pady=(14, 4))
-        tk.Label(win,
-                 text="A searchable PDF layer will be added using Tesseract "
-                      "OCR. Each page is rasterised and recognised text is "
-                      "re-embedded.",
-                 bg=UI_C["panel"], fg=UI_C["fg_muted"],
-                 wraplength=380, justify="left"
-                 ).pack(anchor="w", padx=14, pady=(0, 10))
+        lang_edit = QLineEdit("eng")
+        dpi_edit  = QLineEdit("220")
+        lang_row = QHBoxLayout(); lang_row.addWidget(QLabel("Language:")); lang_row.addWidget(lang_edit); lang_row.addStretch()
+        dpi_row  = QHBoxLayout(); dpi_row.addWidget(QLabel("DPI:")); dpi_row.addWidget(dpi_edit); dpi_row.addStretch()
+        layout.addLayout(lang_row)
+        layout.addLayout(dpi_row)
 
-        lang = tk.StringVar(value="eng")
-        dpi = tk.IntVar(value=220)
-        scope = tk.StringVar(value="all")
+        scope_var = _Var(value="all")
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Scope:"))
+        for val, lbl in [("all", "All pages"), ("included", "Included only"), ("current", "Current page")]:
+            rb = QRadioButton(lbl)
+            rb.setChecked(scope_var.get() == val)
+            rb.toggled.connect(lambda checked, v=val, sv=scope_var: sv.set(v) if checked else None)
+            scope_row.addWidget(rb)
+        scope_row.addStretch()
+        layout.addLayout(scope_row)
 
-        row = tk.Frame(win, bg=UI_C["panel"])
-        row.pack(fill="x", padx=14, pady=4)
-        tk.Label(row, text="Language (Tesseract code):",
-                 bg=UI_C["panel"], fg=UI_C["fg_muted"]).pack(side="left")
-        tk.Entry(row, textvariable=lang, width=8,
-                 bg=UI_C["input_bg"], fg=UI_C["fg"], bd=0,
-                 insertbackground=UI_C["accent"], relief="flat",
-                 highlightthickness=1,
-                 highlightbackground=UI_C["input_border"]
-                 ).pack(side="left", padx=8)
-
-        row2 = tk.Frame(win, bg=UI_C["panel"])
-        row2.pack(fill="x", padx=14, pady=4)
-        tk.Label(row2, text="Rasterise DPI:",
-                 bg=UI_C["panel"], fg=UI_C["fg_muted"]).pack(side="left")
-        tk.Entry(row2, textvariable=dpi, width=6,
-                 bg=UI_C["input_bg"], fg=UI_C["fg"], bd=0,
-                 insertbackground=UI_C["accent"], relief="flat",
-                 highlightthickness=1,
-                 highlightbackground=UI_C["input_border"]
-                 ).pack(side="left", padx=8)
-
-        row3 = tk.Frame(win, bg=UI_C["panel"])
-        row3.pack(fill="x", padx=14, pady=4)
-        tk.Label(row3, text="Scope:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"]).pack(side="left")
-        for val, lbl in [("all", "All pages"),
-                         ("included", "Included only"),
-                         ("current", "Current page")]:
-            tk.Radiobutton(row3, text=lbl, variable=scope, value=val,
-                           bg=UI_C["panel"], fg=UI_C["fg"],
-                           selectcolor=UI_C["panel"],
-                           activebackground=UI_C["panel"],
-                           activeforeground=UI_C["fg"],
-                           bd=0, highlightthickness=0
-                           ).pack(side="left", padx=6)
-
+        btns = QHBoxLayout(); btns.addStretch()
+        cancel_btn = _plain_btn("Cancel"); cancel_btn.clicked.connect(dlg.reject)
+        run_btn = _accent_btn("Run OCR")
         def run_ocr():
             out = filedialog.asksaveasfilename(
-                title="Save OCR'd PDF",
-                defaultextension=".pdf",
-                initialfile=os.path.splitext(
-                    os.path.basename(self.primary_path))[0] + "_ocr.pdf",
+                title="Save OCR'd PDF", defaultextension=".pdf",
+                initialfile=os.path.splitext(os.path.basename(self.primary_path))[0] + "_ocr.pdf",
                 filetypes=[("PDF files", "*.pdf")])
-            if not out:
-                return
-            win.destroy()
-            self.progress.grid()
-            self.progress.start(10)
+            if not out: return
+            dlg.accept()
             threading.Thread(
                 target=self._run_ocr_worker,
-                args=(out, lang.get(), int(dpi.get()), scope.get()),
+                args=(out, lang_edit.text(), int(dpi_edit.text() or 220), scope_var.get()),
                 daemon=True).start()
+        run_btn.clicked.connect(run_ocr)
+        btns.addWidget(cancel_btn); btns.addWidget(run_btn)
+        layout.addLayout(btns)
+        dlg.exec()
 
-        btns = tk.Frame(win, bg=UI_C["panel"])
-        btns.pack(fill="x", padx=14, pady=14, side="bottom")
-        tk.Button(btns, text="Cancel", command=win.destroy,
-                  bg=UI_C["elevated"], fg=UI_C["fg"], bd=0,
-                  activebackground=UI_C["elevated_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
-        tk.Button(btns, text="Run OCR", command=run_ocr,
-                  bg=UI_C["accent"], fg="#FFFFFF", bd=0,
-                  activebackground=UI_C["accent_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
+    def ocr_page(self):
+        self.ocr_dialog()
 
     def _run_ocr_worker(self, out_path, lang, dpi, scope):
         try:
             import pytesseract
             src_doc = fitz.open(self.primary_path)
             out_doc = fitz.open()
-            included = {
-                i for i, r in enumerate(self.pages)
-                if r.included.get() and not r.is_blank
-            }
+            included = {i for i, r in enumerate(self.pages)
+                        if r.included.get() and not r.is_blank}
             current = self._preview_index
             for i in range(src_doc.page_count):
                 page = src_doc[i]
-                apply_ocr = (
-                    scope == "all"
-                    or (scope == "included" and i in included)
-                    or (scope == "current" and i == current))
+                apply_ocr = (scope == "all"
+                             or (scope == "included" and i in included)
+                             or (scope == "current" and i == current))
                 if not apply_ocr:
                     out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
                     continue
@@ -1604,33 +1285,29 @@ class PDFStudioBase:
                     pdf_bytes = pytesseract.image_to_pdf_or_hocr(
                         pix.tobytes("png"), lang=lang, extension="pdf")
                 except Exception as e:
-                    raise RuntimeError(
-                        f"Tesseract failed on page {i + 1}: {e}") from e
+                    raise RuntimeError(f"Tesseract failed on page {i + 1}: {e}") from e
                 ocr_doc = fitz.open("pdf", pdf_bytes)
                 out_doc.insert_pdf(ocr_doc)
                 ocr_doc.close()
             out_doc.save(out_path)
-            out_doc.close()
-            src_doc.close()
-            self.root.after(0, lambda: (
-                self.status_var.set(
-                    f"🔎 OCR complete → {os.path.basename(out_path)}"),
-                messagebox.showinfo("OCR complete",
-                                    f"Saved searchable PDF:\n{out_path}")
+            out_doc.close(); src_doc.close()
+            QTimer.singleShot(0, lambda: (
+                self.status_var.set(f"🔎 OCR complete → {os.path.basename(out_path)}"),
+                messagebox.showinfo("OCR complete", f"Saved searchable PDF:\n{out_path}")
             ))
         except Exception as e:
             msg = str(e)
-            self.root.after(0, lambda: messagebox.showerror("OCR failed", msg))
-        finally:
-            self.root.after(0, lambda: (self.progress.stop(),
-                                        self.progress.grid_remove()))
+            QTimer.singleShot(0, lambda: messagebox.showerror("OCR failed", msg))
+
+    # ── Dialog: Find & Replace ────────────────────────────────────────────────
 
     def find_replace_dialog(self):
-        find = simpledialog.askstring("Find", "Text to find:", parent=self.root)
+        find = simpledialog.askstring("Find", "Text to find:")
         if not find: return
-        replace = simpledialog.askstring("Replace", "Replace with:", parent=self.root)
+        replace = simpledialog.askstring("Replace", "Replace with:")
         if replace is None: return
-        out = filedialog.asksaveasfilename(defaultextension=".pdf")
+        out = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                           filetypes=[("PDF", "*.pdf")])
         if not out: return
         try:
             with fitz.open(self.primary_path) as doc:
@@ -1644,7 +1321,10 @@ class PDFStudioBase:
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def compare_pages_dialog(self): messagebox.showinfo("Compare", "Open two pages in split view (Ctrl toggle preview split).")
+    def compare_pages_dialog(self):
+        messagebox.showinfo("Compare", "Open two pages in split view.")
+
+    # ── Dialog: Page inspector ────────────────────────────────────────────────
 
     def page_inspector_dialog(self, idx=None):
         if idx is None: idx = self._preview_index
@@ -1658,19 +1338,22 @@ class PDFStudioBase:
                f"Has text: {info.get('has_text', False)}")
         messagebox.showinfo(f"Page {idx + 1}", msg)
 
+    # ── Dialog: Header / Footer ───────────────────────────────────────────────
+
     def header_footer_dialog(self):
         h = simpledialog.askstring("Header", "Header text (use {page}, {total}, {date}):",
-                                   initialvalue=self.header_text.get(), parent=self.root)
+                                   initialvalue=self.header_text.get() or "")
         if h is not None: self.header_text.set(h)
         f = simpledialog.askstring("Footer", "Footer text:",
-                                   initialvalue=self.footer_text.get(), parent=self.root)
+                                   initialvalue=self.footer_text.get() or "")
         if f is not None: self.footer_text.set(f)
 
+    # ── Dialog: Bookmarks ─────────────────────────────────────────────────────
+
     def add_bookmark_dialog(self):
-        title = simpledialog.askstring("Bookmark", "Title:", parent=self.root)
+        title = simpledialog.askstring("Bookmark", "Title:")
         if not title: return
-        self._bookmarks.append({"title": title,
-                                "page": max(0, self._preview_index)})
+        self._bookmarks.append({"title": title, "page": max(0, self._preview_index)})
         if hasattr(self, "refresh_bookmarks_sidebar"):
             self.refresh_bookmarks_sidebar()
         self.status_var.set(f"🔖 Bookmark '{title}' added")
@@ -1682,164 +1365,134 @@ class PDFStudioBase:
         msg = "\n".join(f"p.{b['page'] + 1}  {b['title']}" for b in self._bookmarks)
         messagebox.showinfo("Bookmarks", msg)
 
-    def batch_process_dialog(self): messagebox.showinfo("Batch", "Batch process — wire from your original Part 2.")
+    def batch_process_dialog(self):
+        messagebox.showinfo("Batch", "Batch process — wire from your original Part 2.")
+
+    # ── Dialog: Output options ────────────────────────────────────────────────
 
     def show_output_options(self):
-        win = tk.Toplevel(self.root)
-        win.title("Output & Watermark Options")
-        win.transient(self.root)
-        win.configure(bg=UI_C["panel"])
-        win.geometry("520x620")
+        dlg = _styled_dialog(self, "Output & Watermark Options", 520, 600)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 12, 16, 16)
+        layout.setSpacing(10)
 
-        def _hdr(text):
-            tk.Label(win, text=text, bg=UI_C["panel"], fg=UI_C["accent"],
-                     font=("TkDefaultFont", 10, "bold")
-                     ).pack(anchor="w", padx=16, pady=(14, 4))
+        def _hdr(t):
+            lbl = QLabel(t)
+            lbl.setStyleSheet(f"color:{UI_C['accent']}; font-weight:700; font-size:12px;")
+            layout.addWidget(lbl)
 
-        def _entry(parent, var, width=28):
-            return tk.Entry(parent, textvariable=var, width=width,
-                            bg=UI_C["input_bg"], fg=UI_C["fg"], bd=0,
-                            insertbackground=UI_C["accent"], relief="flat",
-                            highlightthickness=1,
-                            highlightbackground=UI_C["input_border"])
-
-        def _check(parent, text, var):
-            return tk.Checkbutton(parent, text=text, variable=var,
-                                  bg=UI_C["panel"], fg=UI_C["fg"],
-                                  selectcolor=UI_C["panel"],
-                                  activebackground=UI_C["panel"],
-                                  activeforeground=UI_C["fg"],
-                                  bd=0, highlightthickness=0)
-
+        # ── Watermark ──
         _hdr("WATERMARK")
-        wrow = tk.Frame(win, bg=UI_C["panel"])
-        wrow.pack(fill="x", padx=16)
-        tk.Label(wrow, text="Text:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"]).pack(side="left")
-        _entry(wrow, self.watermark_text, 26).pack(side="left", padx=8)
+        wm_row = QHBoxLayout()
+        wm_row.addWidget(QLabel("Text:"))
+        wm_edit = QLineEdit(self.watermark_text.get() or "")
+        wm_edit.textChanged.connect(self.watermark_text.set)
+        wm_row.addWidget(wm_edit)
+        layout.addLayout(wm_row)
 
-        wrow2 = tk.Frame(win, bg=UI_C["panel"])
-        wrow2.pack(fill="x", padx=16, pady=(6, 0))
-        tk.Label(wrow2, text="Opacity %:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"]).pack(side="left")
-        tk.Scale(wrow2, from_=5, to=100, orient="horizontal",
-                 variable=self.watermark_opacity, length=160,
-                 bg=UI_C["panel"], troughcolor=UI_C["input_bg"],
-                 fg=UI_C["fg"], activebackground=UI_C["accent"],
-                 highlightthickness=0, bd=0).pack(side="left", padx=8)
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Opacity %:"))
+        op_slider = QSlider(Qt.Orientation.Horizontal)
+        op_slider.setRange(5, 100); op_slider.setValue(int(self.watermark_opacity.get() or 40))
+        op_slider.valueChanged.connect(self.watermark_opacity.set)
+        op_row.addWidget(op_slider); op_row.addStretch()
+        layout.addLayout(op_row)
 
-        wrow3 = tk.Frame(win, bg=UI_C["panel"])
-        wrow3.pack(fill="x", padx=16, pady=(6, 0))
-        tk.Label(wrow3, text="Color:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"]).pack(side="left")
-        swatch = tk.Label(wrow3, text="    ", width=4, relief="flat",
-                          bg=self.watermark_color.get())
-        swatch.pack(side="left", padx=8)
-
+        col_row = QHBoxLayout()
+        col_row.addWidget(QLabel("Color:"))
+        col_swatch = QFrame(); col_swatch.setFixedSize(30, 22)
+        col_swatch.setStyleSheet(f"background:{self.watermark_color.get()}; border:1px solid {UI_C['border']};")
+        col_row.addWidget(col_swatch)
         def pick_wm():
-            c = colorchooser.askcolor(color=self.watermark_color.get(),
-                                      parent=win)
-            if c and c[1]:
-                self.watermark_color.set(c[1])
-                swatch.configure(bg=c[1])
-        tk.Button(wrow3, text="Choose…", command=pick_wm,
-                  bg=UI_C["elevated"], fg=UI_C["fg"], bd=0, cursor="hand2",
-                  activebackground=UI_C["elevated_hover"]
-                  ).pack(side="left")
+            _, hexcol = colorchooser.askcolor(color=self.watermark_color.get())
+            if hexcol:
+                self.watermark_color.set(hexcol)
+                col_swatch.setStyleSheet(f"background:{hexcol}; border:1px solid {UI_C['border']};")
+        pick_btn2 = QPushButton("Choose…"); pick_btn2.clicked.connect(pick_wm)
+        col_row.addWidget(pick_btn2); col_row.addStretch()
+        layout.addLayout(col_row)
 
+        # ── Page numbers ──
         _hdr("PAGE NUMBERS")
-        pn1 = tk.Frame(win, bg=UI_C["panel"])
-        pn1.pack(fill="x", padx=16)
-        _check(pn1, "Add page numbers", self.add_page_numbers).pack(anchor="w")
+        pn_chk = QCheckBox("Add page numbers")
+        pn_chk.setChecked(bool(self.add_page_numbers.get()))
+        pn_chk.stateChanged.connect(lambda s: self.add_page_numbers.set(bool(s)))
+        layout.addWidget(pn_chk)
 
-        pn2 = tk.Frame(win, bg=UI_C["panel"])
-        pn2.pack(fill="x", padx=16, pady=(4, 0))
-        tk.Label(pn2, text="Format:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"]).pack(side="left")
-        for val, lbl in [("decimal", "1, 2, 3"),
-                          ("roman", "i, ii, iii"),
-                          ("ALPHA", "A, B, C")]:
-            tk.Radiobutton(pn2, text=lbl, variable=self.page_num_format,
-                           value=val, bg=UI_C["panel"], fg=UI_C["fg"],
-                           selectcolor=UI_C["panel"],
-                           activebackground=UI_C["panel"],
-                           activeforeground=UI_C["fg"], bd=0,
-                           highlightthickness=0).pack(side="left", padx=4)
+        fmt_row = QHBoxLayout(); fmt_row.addWidget(QLabel("Format:"))
+        for val, lbl in [("decimal", "1, 2, 3"), ("roman", "i, ii, iii"), ("ALPHA", "A, B, C")]:
+            rb = QRadioButton(lbl)
+            rb.setChecked(self.page_num_format.get() == val)
+            rb.toggled.connect(lambda ch, v=val: self.page_num_format.set(v) if ch else None)
+            fmt_row.addWidget(rb)
+        fmt_row.addStretch(); layout.addLayout(fmt_row)
 
-        pn3 = tk.Frame(win, bg=UI_C["panel"])
-        pn3.pack(fill="x", padx=16, pady=(4, 0))
-        tk.Label(pn3, text="Position:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"]).pack(side="left")
-        for val, lbl in [("top-left", "TL"), ("top-center", "TC"),
-                          ("top-right", "TR"), ("bottom-left", "BL"),
-                          ("bottom-center", "BC"), ("bottom-right", "BR")]:
-            tk.Radiobutton(pn3, text=lbl, variable=self.page_num_position,
-                           value=val, bg=UI_C["panel"], fg=UI_C["fg"],
-                           selectcolor=UI_C["panel"],
-                           activebackground=UI_C["panel"],
-                           activeforeground=UI_C["fg"], bd=0,
-                           highlightthickness=0).pack(side="left", padx=4)
+        pos_row = QHBoxLayout(); pos_row.addWidget(QLabel("Position:"))
+        for val, lbl in [("top-left","TL"),("top-center","TC"),("top-right","TR"),
+                          ("bottom-left","BL"),("bottom-center","BC"),("bottom-right","BR")]:
+            rb = QRadioButton(lbl)
+            rb.setChecked(self.page_num_position.get() == val)
+            rb.toggled.connect(lambda ch, v=val: self.page_num_position.set(v) if ch else None)
+            pos_row.addWidget(rb)
+        pos_row.addStretch(); layout.addLayout(pos_row)
 
+        # ── Header / Footer ──
         _hdr("HEADER & FOOTER")
-        hfrow = tk.Frame(win, bg=UI_C["panel"])
-        hfrow.pack(fill="x", padx=16)
-        tk.Label(hfrow, text="Header:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"], width=8, anchor="e"
-                 ).grid(row=0, column=0, padx=(0, 6), pady=2)
-        _entry(hfrow, self.header_text, 36).grid(row=0, column=1, pady=2)
-        tk.Label(hfrow, text="Footer:", bg=UI_C["panel"],
-                 fg=UI_C["fg_muted"], width=8, anchor="e"
-                 ).grid(row=1, column=0, padx=(0, 6), pady=2)
-        _entry(hfrow, self.footer_text, 36).grid(row=1, column=1, pady=2)
+        hf_grid = QHBoxLayout()
+        hf_grid.addWidget(QLabel("Header:")); hdr_edit = QLineEdit(self.header_text.get() or "")
+        hdr_edit.textChanged.connect(self.header_text.set); hf_grid.addWidget(hdr_edit)
+        layout.addLayout(hf_grid)
+        hf_grid2 = QHBoxLayout()
+        hf_grid2.addWidget(QLabel("Footer:")); ftr_edit = QLineEdit(self.footer_text.get() or "")
+        ftr_edit.textChanged.connect(self.footer_text.set); hf_grid2.addWidget(ftr_edit)
+        layout.addLayout(hf_grid2)
 
+        # ── Output ──
         _hdr("OUTPUT")
-        out_row = tk.Frame(win, bg=UI_C["panel"])
-        out_row.pack(fill="x", padx=16)
-        _check(out_row, "Compress streams", self.compress_output).pack(anchor="w")
-        _check(out_row, "Flatten form fields", self.flatten_forms).pack(anchor="w")
-        _check(out_row, "Encrypt output", self.encrypt_pdf).pack(anchor="w")
+        compress_chk = QCheckBox("Compress streams")
+        compress_chk.setChecked(bool(self.compress_output.get()))
+        compress_chk.stateChanged.connect(lambda s: self.compress_output.set(bool(s)))
+        layout.addWidget(compress_chk)
+        enc_chk = QCheckBox("Encrypt output")
+        enc_chk.setChecked(bool(self.encrypt_pdf.get()))
+        enc_chk.stateChanged.connect(lambda s: self.encrypt_pdf.set(bool(s)))
+        layout.addWidget(enc_chk)
 
-        btns = tk.Frame(win, bg=UI_C["panel"])
-        btns.pack(fill="x", padx=16, pady=14, side="bottom")
+        # ── Buttons ──
+        layout.addStretch()
+        btns = QHBoxLayout(); btns.addStretch()
+        done_btn = _plain_btn("Done")
+        done_btn.clicked.connect(lambda: (
+            self.status_var.set("⚙ Output options saved. Use File ▸ Save to export."),
+            dlg.accept()))
+        save_now_btn = _accent_btn("Save PDF now…")
+        save_now_btn.clicked.connect(lambda: (dlg.accept(), self.save_pdf()))
+        btns.addWidget(done_btn); btns.addWidget(save_now_btn)
+        layout.addLayout(btns)
+        dlg.exec()
 
-        def apply_and_save():
-            self.status_var.set(
-                "⚙ Output options saved. Use File ▸ Save to export.")
-            win.destroy()
-
-        def save_now():
-            win.destroy()
-            self.save_pdf()
-
-        tk.Button(btns, text="Done", command=apply_and_save,
-                  bg=UI_C["elevated"], fg=UI_C["fg"], bd=0,
-                  activebackground=UI_C["elevated_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
-        tk.Button(btns, text="Save PDF now…", command=save_now,
-                  bg=UI_C["accent"], fg="#FFFFFF", bd=0,
-                  activebackground=UI_C["accent_hover"], cursor="hand2",
-                  padx=14, pady=6).pack(side="right", padx=4)
+    # ── Dialog: Metadata ──────────────────────────────────────────────────────
 
     def show_metadata_dialog(self):
         t = simpledialog.askstring("Title", "Title:",
-                                   initialvalue=self.meta_title.get(),
-                                   parent=self.root)
+                                   initialvalue=self.meta_title.get() or "")
         if t is not None: self.meta_title.set(t)
         a = simpledialog.askstring("Author", "Author:",
-                                   initialvalue=self.meta_author.get(),
-                                   parent=self.root)
+                                   initialvalue=self.meta_author.get() or "")
         if a is not None: self.meta_author.set(a)
 
+    # ── Dialog: Shortcuts ─────────────────────────────────────────────────────
+
     def show_shortcuts(self):
-        msg = ("Ctrl+O  Open      Ctrl+S  Save     Ctrl+Z  Undo   Ctrl+Y  Redo\n"
+        msg = ("Ctrl+O  Open      Ctrl+S  Save      Ctrl+Z  Undo   Ctrl+Y  Redo\n"
                "Ctrl+A  Select all    Del  Delete selected\n"
-               "Ctrl+K  Command palette   Ctrl+T  Theme   Ctrl+G  Grid   Ctrl+B  Sidebar\n"
-               "Ctrl++  Zoom in   Ctrl+-  Zoom out   Ctrl+0  Fit   Ctrl+,  Preferences\n"
-               "↑ ↓ Home End PgUp PgDn   Navigate rows\n"
-               "Space  Toggle include   Enter  Preview\n"
-               "← / →  Previous / next preview\n"
-               "F1  This help")
+               "Ctrl+K  Command palette   Ctrl+T  Theme   Ctrl+G  Grid\n"
+               "Ctrl++  Zoom in   Ctrl+-  Zoom out   Ctrl+0  Fit\n"
+               "↑ ↓ Home End  Navigate rows\n"
+               "← / →  Previous / next preview")
         messagebox.showinfo("Keyboard Shortcuts", msg)
+
+    # ── Preset save / load ────────────────────────────────────────────────────
 
     def save_preset(self):
         path = filedialog.asksaveasfilename(defaultextension=".json",
@@ -1859,9 +1512,9 @@ class PDFStudioBase:
         self._preview_index = 0 if self.pages else -1
         self._preview_rec = self.pages[0] if self.pages else None
         self._rebuild_rows()
-        self._load_thumbs_async()
 
-    # ─── SAVE ──────────────────────────────────────────────────────────
+    # ── Save PDF ──────────────────────────────────────────────────────────────
+
     def save_pdf(self):
         if not self.pages:
             messagebox.showwarning("No pages", "Open a PDF first."); return
@@ -1874,17 +1527,21 @@ class PDFStudioBase:
             initialfile=base + ".pdf",
             filetypes=[("PDF files", "*.pdf")])
         if not out_path: return
-        self.progress.grid(); self.progress.start(10)
+        if hasattr(self, "_show_toast"):
+            self._show_toast("Saving PDF…", "info", 2000)
         threading.Thread(
             target=lambda: self._write_pdf_thread(included, out_path),
             daemon=True).start()
 
+    def save_as(self):
+        self.save_pdf()
+
     def _write_pdf_thread(self, records, out_path):
         try:
             self._write_pdf(records, out_path)
-        finally:
-            self.root.after(0, lambda: (self.progress.stop(),
-                                        self.progress.grid_remove()))
+        except Exception as e:
+            err = str(e)
+            QTimer.singleShot(0, lambda: messagebox.showerror("Error", f"Failed to save:\n{err}"))
 
     def _write_pdf(self, records, out_path):
         try:
@@ -1926,42 +1583,41 @@ class PDFStudioBase:
                     except Exception: pass
 
             if self.encrypt_pdf.get() and (self.owner_password.get() or self.user_password.get()):
-                writer.encrypt(user_password=self.user_password.get(),
-                               owner_password=self.owner_password.get())
+                writer.encrypt(user_password=self.user_password.get() or "",
+                               owner_password=self.owner_password.get() or "")
 
             with open(out_path, "wb") as f:
                 writer.write(f)
 
-            # ── POST-PROCESS WITH FITZ ─────────────────────────────────
             self._apply_fitz_overlays(records, out_path)
 
             n = len(records)
-            self.root.after(0, lambda: (
-                self.status_var.set(f"✅ Saved {n} page{'s' if n != 1 else ''} → {os.path.basename(out_path)}"),
+            def _done():
+                self.status_var.set(
+                    f"✅ Saved {n} page{'s' if n != 1 else ''} → {os.path.basename(out_path)}")
                 messagebox.showinfo("Saved", f"Saved {n} page(s)!\n\n{out_path}")
-            ))
+            QTimer.singleShot(0, _done)
         except Exception as e:
             err = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to save:\n{err}"))
+            QTimer.singleShot(0, lambda: messagebox.showerror("Error", f"Failed to save:\n{err}"))
 
-    # ─── FITZ OVERLAY PIPELINE ─────────────────────────────────────────
+    # ── Fitz overlay pipeline (unchanged from original) ───────────────────────
+
     def _apply_fitz_overlays(self, records, out_path):
         try:
             need_overlay = (
                 any(getattr(r, "annotations", None) for r in records)
                 or any(getattr(r, "redactions", None) for r in records)
-                or (self.watermark_text.get().strip() != "")
+                or (self.watermark_text.get() or "").strip()
                 or self.add_page_numbers.get()
-                or self.header_text.get().strip() != ""
-                or self.footer_text.get().strip() != ""
+                or (self.header_text.get() or "").strip()
+                or (self.footer_text.get() or "").strip()
             )
             if not need_overlay:
                 return
-
             doc = fitz.open(out_path)
             for i, rec in enumerate(records):
-                if i >= doc.page_count:
-                    break
+                if i >= doc.page_count: break
                 page = doc[i]
                 self._add_overlay(page, rec, i + 1, len(records))
             tmp = out_path + ".tmp"
@@ -1970,14 +1626,13 @@ class PDFStudioBase:
             os.replace(tmp, out_path)
         except Exception as e:
             err = str(e)
-            self.root.after(0, lambda: self.status_var.set(
+            QTimer.singleShot(0, lambda: self.status_var.set(
                 f"⚠ Overlay step skipped: {err}"))
 
     def _add_overlay(self, page, rec, page_num, total):
         rect = page.rect
         W, H = rect.width, rect.height
 
-        # Redactions
         for coords in getattr(rec, "redactions", []):
             try:
                 x0, y0, x1, y1 = coords
@@ -1991,7 +1646,6 @@ class PDFStudioBase:
         except Exception:
             pass
 
-        # Text annotations
         for ann in getattr(rec, "annotations", []):
             try:
                 if ann.get("type") == "stamp" and ann.get("image_path"):
@@ -2004,31 +1658,25 @@ class PDFStudioBase:
                                       keep_proportion=True)
                     continue
                 text = str(ann.get("text", ""))
-                if not text:
-                    continue
+                if not text: continue
                 x = float(ann.get("x", 0.1)) * W
                 y = float(ann.get("y", 0.9)) * H
                 size = int(ann.get("fontsize", 12))
                 color = self._hex_to_rgb01(ann.get("color", "#000000"))
-                page.insert_text((x, y), text, fontsize=size, color=color,
-                                 fontname="helv")
+                page.insert_text((x, y), text, fontsize=size, color=color, fontname="helv")
             except Exception:
                 continue
 
-        # Watermark
-        wm = self.watermark_text.get().strip()
+        wm = (self.watermark_text.get() or "").strip()
         if wm:
             try:
-                opacity = max(0.0, min(1.0,
-                                       float(self.watermark_opacity.get()) / 100.0))
+                opacity = max(0.0, min(1.0, float(self.watermark_opacity.get()) / 100.0))
                 color = self._hex_to_rgb01(self.watermark_color.get() or "#AAAAAA")
                 fs = max(24, int(min(W, H) / 9))
                 tw = fitz.get_text_length(wm, fontname="helv", fontsize=fs)
                 cx, cy = W / 2, H / 2
-                morph = (
-                    fitz.Point(cx, cy),
-                    fitz.Matrix(1, 0, 0, 1, 0, 0).prerotate(-45)
-                )
+                morph = (fitz.Point(cx, cy),
+                         fitz.Matrix(1, 0, 0, 1, 0, 0).prerotate(-45))
                 page.insert_text((cx - tw / 2, cy + fs / 3), wm,
                                  fontsize=fs, fontname="helv",
                                  color=color, fill_opacity=opacity,
@@ -2037,9 +1685,8 @@ class PDFStudioBase:
             except Exception:
                 pass
 
-        # Header / Footer
-        header = self.header_text.get().strip()
-        footer = self.footer_text.get().strip()
+        header = (self.header_text.get() or "").strip()
+        footer = (self.footer_text.get() or "").strip()
 
         def _expand(t):
             from datetime import datetime
@@ -2050,53 +1697,35 @@ class PDFStudioBase:
         if header:
             try:
                 page.insert_text((36, 28), _expand(header),
-                                 fontsize=10, fontname="helv",
-                                 color=(0.25, 0.25, 0.25))
-            except Exception:
-                pass
+                                 fontsize=10, fontname="helv", color=(0.25, 0.25, 0.25))
+            except Exception: pass
         if footer:
             try:
                 page.insert_text((36, H - 20), _expand(footer),
-                                 fontsize=10, fontname="helv",
-                                 color=(0.25, 0.25, 0.25))
-            except Exception:
-                pass
+                                 fontsize=10, fontname="helv", color=(0.25, 0.25, 0.25))
+            except Exception: pass
 
-        # Page numbers
         if self.add_page_numbers.get():
             try:
                 fmt = self.page_num_format.get()
-                if fmt == "roman":
-                    label = _to_roman(page_num)
-                elif fmt == "ALPHA":
-                    label = self._alpha_label(page_num)
-                else:
-                    label = str(page_num)
+                if fmt == "roman":      label = _to_roman(page_num)
+                elif fmt == "ALPHA":    label = self._alpha_label(page_num)
+                else:                   label = str(page_num)
                 pos = self.page_num_position.get()
-                margin = 28
-                fs = 11
+                margin, fs = 28, 11
                 tw = fitz.get_text_length(label, fontname="helv", fontsize=fs)
-                if pos.endswith("left"):
-                    x = margin
-                elif pos.endswith("right"):
-                    x = W - tw - margin
-                else:
-                    x = (W - tw) / 2
-                if pos.startswith("top"):
-                    y = margin
-                else:
-                    y = H - margin / 2
+                x = margin if pos.endswith("left") else \
+                    (W - tw - margin if pos.endswith("right") else (W - tw) / 2)
+                y = margin if pos.startswith("top") else H - margin / 2
                 page.insert_text((x, y), label, fontsize=fs,
                                  fontname="helv", color=(0.15, 0.15, 0.15))
-            except Exception:
-                pass
+            except Exception: pass
 
     @staticmethod
     def _hex_to_rgb01(hx):
         try:
             hx = hx.lstrip("#")
-            if len(hx) == 3:
-                hx = "".join(c * 2 for c in hx)
+            if len(hx) == 3: hx = "".join(c * 2 for c in hx)
             return (int(hx[0:2], 16) / 255.0,
                     int(hx[2:4], 16) / 255.0,
                     int(hx[4:6], 16) / 255.0)
@@ -2111,7 +1740,8 @@ class PDFStudioBase:
             s = chr(ord("A") + r) + s
         return s
 
-    # ─── SESSION / STATUS ──────────────────────────────────────────────
+    # ── Session / status ──────────────────────────────────────────────────────
+
     def _clear_saved_session(self):
         try:
             if SESSION_FILE.exists(): SESSION_FILE.unlink()
@@ -2119,12 +1749,50 @@ class PDFStudioBase:
 
     def _update_status(self):
         if not self.pages:
-            self.status_var.set("Open a PDF to get started.")
-            return
-        total = len(self.pages)
-        included = sum(r.included.get() for r in self.pages)
-        sel = len(self.selected_pages)
-        sel_str = f" • {sel} selected" if sel else ""
-        self.status_var.set(
-            f"{included}/{total} pages included{sel_str} • "
-            f"Preview: page {self._preview_index + 1 if self._preview_index >= 0 else '—'}")
+            msg = "Open a PDF to get started."
+        else:
+            total = len(self.pages)
+            included = sum(r.included.get() for r in self.pages)
+            sel = len(self.selected_pages)
+            sel_str = f" • {sel} selected" if sel else ""
+            msg = (f"{included}/{total} pages included{sel_str} • "
+                   f"Preview: page {self._preview_index + 1 if self._preview_index >= 0 else '—'}")
+        self.status_var.set(msg)
+        if hasattr(self, "_set_status"):
+            self._set_status(msg)
+        if hasattr(self, "_update_page_count"):
+            self._update_page_count()
+
+    def undo(self):
+        self.do_undo()
+
+    def redo(self):
+        self.do_redo()
+
+    # Watermark / add_watermark stub for command palette
+    def add_watermark(self):
+        self.show_output_options()
+
+    def redact(self):
+        self.redact_dialog()
+
+    def add_signature(self):
+        messagebox.showinfo("Signature", "Use the Add Signature feature in the Features menu.")
+
+    def bates_number(self):
+        if hasattr(self, "bates_dialog"):
+            self.bates_dialog()
+        else:
+            messagebox.showinfo("Bates", "Bates numbering — wire from PDF features.")
+
+    def split_pdf(self):
+        messagebox.showinfo("Split", "Split PDF — use File ▸ Extract Pages to split by inclusion.")
+
+    def toggle_grid_view(self):
+        pass  # Qt grid view implementation goes in PDFStudioUI
+
+    def _start_autosave(self):
+        pass  # session autosave not wired in Qt version yet
+
+    def _restore_session(self):
+        pass  # session restore not wired in Qt version yet

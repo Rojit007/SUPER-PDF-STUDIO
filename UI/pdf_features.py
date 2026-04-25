@@ -1,47 +1,46 @@
 """
-PDF Studio – Feature Mixin
+UI/pdf_features.py  –  PySide6 port
 ─────────────────────────────────────────────────────────────────────────────
-Adobe Acrobat-Pro-parity features added on top of the existing PDFStudio
-backend. Mix this class into your PDFStudio hierarchy:
+Adobe Acrobat-Pro-parity features.  Mix into the PDFStudio hierarchy:
 
-    from UI.pdf_studio_ui import PDFStudioUI
-    from UI.pdf_features import PDFFeatures
+    class PDFStudio(PDFStudioUI, PDFFeatures, PDFStudioBase): ...
 
-    class PDFStudio(PDFStudioUI, PDFFeatures):
-        ...
-
-Every feature:
-    • Opens a themed dialog
-    • Does real work with pypdf / PyMuPDF / Pillow (libraries you already
-      ship in requirements)
-    • Shows toast + status-bar confirmation
-    • Pushes undo if it mutates `self.pages`
+All dialogs now use PySide6 / QDialog.  No tkinter dependency.
 """
 from __future__ import annotations
-import os
-import io
-import re
 import math
-import copy
+import os
+import re
 import tempfile
-import tkinter as tk
-from tkinter import filedialog, messagebox, colorchooser
 
 import fitz
-from PIL import Image, ImageDraw, ImageTk, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 from pypdf import PdfReader, PdfWriter
 
-from UI.pdf_studio_ui import C, _get_toaster
-from UI.dialog_kit import (
-    themed_toplevel, themed_button, themed_entry, themed_check, themed_radio,
-    section, field_row,
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView, QHBoxLayout, QLabel, QListWidget,
+    QScrollArea, QSizePolicy, QTextEdit, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, QPushButton,
+)
+
+from pdf_studio_common import _Var
+from UI.pdf_studio_ui_qt import C
+from UI.qt_compat import colorchooser, filedialog, messagebox, simpledialog
+from UI.dialog_kit_qt import (
+    field_row, section, themed_button, themed_check, themed_dialog,
+    themed_entry, themed_radio, themed_scale, themed_spin,
 )
 
 
-def _toast(ui, msg, kind="info"):
-    tx = _get_toaster(ui)
-    if tx:
-        tx.show(msg, kind=kind)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _toast(ui, msg: str, kind: str = "info") -> None:
+    if hasattr(ui, "_show_toast"):
+        ui._show_toast(msg, kind)
     try:
         ui.status_var.set(msg)
     except Exception:
@@ -49,9 +48,150 @@ def _toast(ui, msg, kind="info"):
 
 
 def _current_pdf_path(ui):
-    """Primary open PDF or empty."""
     return getattr(ui, "primary_path", None)
 
+
+def _fitz_pixmap_to_qpixmap(pix) -> QPixmap:
+    qimg = QImage(pix.samples, pix.width, pix.height,
+                  pix.stride, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Custom widgets used by feature dialogs
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SignatureCanvas(QWidget):
+    """Free-draw signature surface backed by QPainter."""
+
+    def __init__(self, width: int = 560, height: int = 180, parent=None):
+        super().__init__(parent)
+        self._strokes: list[list] = []
+        self._pen_color = QColor("#0A1F3D")
+        self._pen_size = 3
+        self.setFixedSize(width, height)
+        self.setStyleSheet(
+            f"background: white; border: 1px solid {C['border']};"
+        )
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._strokes.append([event.position().toPoint()])
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton and self._strokes:
+            self._strokes[-1].append(event.position().toPoint())
+            self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), Qt.GlobalColor.white)
+        pen = QPen(self._pen_color, self._pen_size,
+                   Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap,
+                   Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        for stroke in self._strokes:
+            for i in range(1, len(stroke)):
+                painter.drawLine(stroke[i - 1], stroke[i])
+
+    def clear(self):
+        self._strokes.clear()
+        self.update()
+
+    def set_pen_color(self, hex_color: str):
+        self._pen_color = QColor(hex_color)
+
+    def set_pen_size(self, size: int):
+        self._pen_size = size
+        self.update()
+
+    def has_strokes(self) -> bool:
+        return bool(self._strokes)
+
+    def render_to_pil(self) -> Image.Image:
+        img = Image.new("RGBA", (self.width(), self.height()), (255, 255, 255, 0))
+        d = ImageDraw.Draw(img)
+        col = self._pen_color.name().lstrip("#")
+        rgb = tuple(int(col[i:i + 2], 16) for i in (0, 2, 4))
+        for stroke in self._strokes:
+            pts = [(p.x(), p.y()) for p in stroke]
+            if len(pts) < 2:
+                continue
+            d.line(pts, fill=(*rgb, 255), width=self._pen_size, joint="curve")
+        return img
+
+
+class _MeasureCanvas(QLabel):
+    """Page image that lets the user click two points and reports distance."""
+
+    def __init__(self, pixmap: QPixmap, page_width: float, parent=None):
+        super().__init__(parent)
+        self._orig = pixmap
+        self._ratio = pixmap.width() / max(page_width, 1)
+        self._points: list = []
+        self._result_cb = None
+        self.setPixmap(pixmap)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+    def set_result_callback(self, cb):
+        self._result_cb = cb
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._points.append(event.position().toPoint())
+        self._redraw()
+        if len(self._points) == 2:
+            (x1, y1), (x2, y2) = [(p.x(), p.y()) for p in self._points]
+            dx = (x2 - x1) / self._ratio
+            dy = (y2 - y1) / self._ratio
+            if self._result_cb:
+                self._result_cb(math.hypot(dx, dy))
+            self._points.clear()
+
+    def _redraw(self):
+        pm = self._orig.copy()
+        painter = QPainter(pm)
+        pen = QPen(QColor(C["accent"]), 2)
+        painter.setPen(pen)
+        for p in self._points:
+            painter.drawEllipse(p, 4, 4)
+        if len(self._points) == 2:
+            painter.drawLine(self._points[0], self._points[1])
+        painter.end()
+        self.setPixmap(pm)
+
+    def reset(self):
+        self._points.clear()
+        self.setPixmap(self._orig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shared layout helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _muted_label(text: str, parent=None) -> QLabel:
+    lbl = QLabel(text, parent)
+    lbl.setStyleSheet(f"color: {C['fg_muted']}; font-size: 10px;")
+    return lbl
+
+
+def _btn_row(parent_widget, cancel_fn, ok_btn_text, ok_fn,
+             ok_style: str = "accent") -> QHBoxLayout:
+    row = QHBoxLayout()
+    row.addStretch()
+    row.addWidget(themed_button(parent_widget, "Cancel", cancel_fn, style="ghost"))
+    row.addWidget(themed_button(parent_widget, ok_btn_text, ok_fn, style=ok_style))
+    return row
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PDFFeatures mixin
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PDFFeatures:
     """Mixin of all Acrobat-Pro-parity features."""
@@ -63,79 +203,80 @@ class PDFFeatures:
         if not getattr(self, "pages", None):
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Bates Numbering", 460, 460)
-        body = win.body
 
-        prefix = tk.StringVar(value="EXHIBIT-")
-        suffix = tk.StringVar(value="")
-        start = tk.IntVar(value=1)
-        digits = tk.IntVar(value=4)
-        pos = tk.StringVar(value="bottom-right")
-        include = tk.StringVar(value="all")
+        dlg = themed_dialog(self, "Bates Numbering", 460, 500)
+        bl = dlg.body_layout
 
-        s1 = section(body, "Format")
-        field_row(s1, "Prefix", themed_entry(s1, textvariable=prefix,
-                                             width=18))
-        field_row(s1, "Suffix", themed_entry(s1, textvariable=suffix,
-                                             width=18))
-        field_row(s1, "Start #", themed_entry(s1, textvariable=start,
-                                              width=8))
-        field_row(s1, "Digits", themed_entry(s1, textvariable=digits,
-                                             width=6),
-                  "zero-pad width")
+        prefix_v = _Var(value="EXHIBIT-")
+        suffix_v = _Var(value="")
+        start_v  = _Var(value=1)
+        digits_v = _Var(value=4)
+        pos_v    = _Var(value="bottom-right")
+        scope_v  = _Var(value="all")
 
-        s2 = section(body, "Position")
-        pr = tk.Frame(s2, bg=C["panel"])
-        pr.pack(anchor="w")
+        s1 = section(bl, "Format")
+        prefix_e = themed_entry(s1, var=prefix_v, width=18)
+        field_row(s1, "Prefix", prefix_e)
+        suffix_e = themed_entry(s1, var=suffix_v, width=18)
+        field_row(s1, "Suffix", suffix_e)
+        start_e  = themed_entry(s1, var=start_v,  width=8)
+        field_row(s1, "Start #", start_e)
+        digits_e = themed_entry(s1, var=digits_v, width=6)
+        field_row(s1, "Digits", digits_e, "zero-pad width")
+
+        s2 = section(bl, "Position")
+        pos_row = QHBoxLayout()
         for val, lbl in [
             ("top-left", "TL"), ("top-center", "TC"), ("top-right", "TR"),
-            ("bottom-left", "BL"), ("bottom-center", "BC"),
-            ("bottom-right", "BR"),
+            ("bottom-left", "BL"), ("bottom-center", "BC"), ("bottom-right", "BR"),
         ]:
-            themed_radio(pr, lbl, pos, val).pack(side="left", padx=4)
+            pos_row.addWidget(themed_radio(s2, lbl, pos_v, val))
+        s2._inner.addLayout(pos_row)
 
-        s3 = section(body, "Scope")
-        sc = tk.Frame(s3, bg=C["panel"])
-        sc.pack(anchor="w")
-        for val, label in [("all", "All pages"),
-                           ("included", "Included only")]:
-            themed_radio(sc, label, include, val).pack(side="left", padx=4)
+        s3 = section(bl, "Scope")
+        scope_row = QHBoxLayout()
+        for val, label in [("all", "All pages"), ("included", "Included only")]:
+            scope_row.addWidget(themed_radio(s3, label, scope_v, val))
+        s3._inner.addLayout(scope_row)
 
-        s4 = section(body, "Preview")
-        preview = tk.Label(
-            s4, text="EXHIBIT-0001",
-            bg=C["elevated"], fg=C["fg"], padx=14, pady=10,
-            font=("TkFixedFont", 14, "bold"))
-        preview.pack(anchor="w")
+        s4 = section(bl, "Preview")
+        preview_lbl = QLabel("EXHIBIT-0001", s4)
+        preview_lbl.setStyleSheet(
+            f"background: {C['elevated']}; color: {C['fg']};"
+            f" font-family: Consolas,monospace; font-size: 14px; font-weight: bold;"
+            f" padding: 10px 14px;"
+        )
+        s4._inner.addWidget(preview_lbl)
 
-        def _upd(*_):
+        def _upd(_=None):
             try:
-                n = int(start.get())
+                n = int(start_v.get())
             except Exception:
                 n = 1
-            d = max(1, int(digits.get() or 4))
-            preview.config(text=f"{prefix.get()}{n:0{d}d}{suffix.get()}")
-        for v in (prefix, suffix, start, digits):
-            v.trace_add("write", _upd)
+            d = max(1, int(digits_v.get() or 4))
+            preview_lbl.setText(f"{prefix_v.get()}{n:0{d}d}{suffix_v.get()}")
 
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=(14, 0))
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Cancel", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
-        themed_button(btns, "Apply & Save", style="accent",
-                      command=lambda: self._run_bates(
-                          win, prefix.get(), suffix.get(), int(start.get()),
-                          int(digits.get() or 4), pos.get(), include.get())
-                      ).pack(side="left", padx=4)
+        prefix_e.textChanged.connect(_upd)
+        suffix_e.textChanged.connect(_upd)
+        start_e.textChanged.connect(_upd)
+        digits_e.textChanged.connect(_upd)
 
-    def _run_bates(self, win, prefix, suffix, start, digits, pos, scope):
+        bl.addLayout(_btn_row(
+            dlg.body, dlg.reject, "Apply & Save",
+            lambda: self._run_bates(
+                dlg, prefix_v.get(), suffix_v.get(),
+                int(start_v.get()), int(digits_v.get() or 4),
+                pos_v.get(), scope_v.get()),
+        ))
+        dlg.exec()
+
+    def _run_bates(self, dlg, prefix, suffix, start, digits, pos, scope):
         out = filedialog.asksaveasfilename(
             title="Save stamped PDF", defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")])
         if not out:
             return
-        win.destroy()
+        dlg.accept()
         path = _current_pdf_path(self)
         if not path:
             _toast(self, "No source PDF", "error")
@@ -150,25 +291,20 @@ class PDFFeatures:
                 text = f"{prefix}{n:0{digits}d}{suffix}"
                 r = page.rect
                 margin = 24
-                if "top" in pos:
-                    y = margin
-                else:
-                    y = r.height - margin
+                y = margin if "top" in pos else r.height - margin
                 if "left" in pos:
                     x = margin
                 elif "right" in pos:
                     x = r.width - margin - 8 * len(text)
                 else:
                     x = r.width / 2 - 4 * len(text)
-                page.insert_text(
-                    fitz.Point(x, y), text,
-                    fontsize=11, color=(0.85, 0.35, 0.15),
-                    fontname="helv")
+                page.insert_text(fitz.Point(x, y), text,
+                                 fontsize=11, color=(0.85, 0.35, 0.15),
+                                 fontname="helv")
                 n += 1
             doc.save(out)
             doc.close()
-            _toast(self, f"Bates-stamped PDF saved → {os.path.basename(out)}",
-                   "success")
+            _toast(self, f"Bates-stamped PDF saved → {os.path.basename(out)}", "success")
         except Exception as e:
             messagebox.showerror("Bates error", str(e))
 
@@ -179,47 +315,38 @@ class PDFFeatures:
         if not _current_pdf_path(self):
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Keyword Bulk Redaction", 500, 500)
-        body = win.body
 
-        tk.Label(body,
-                 text="Enter one term per line. Regex supported when enabled.",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 9)).pack(anchor="w")
+        dlg = themed_dialog(self, "Keyword Bulk Redaction", 500, 520)
+        bl = dlg.body_layout
 
-        txt_wrap = tk.Frame(body, bg=C["elevated"],
-                            highlightthickness=1,
-                            highlightbackground=C["border"])
-        txt_wrap.pack(fill="both", expand=True, pady=6)
-        txt = tk.Text(txt_wrap, bd=0, bg=C["elevated"], fg=C["fg"],
-                      insertbackground=C["accent"],
-                      font=("TkFixedFont", 10), relief="flat",
-                      highlightthickness=0, height=10)
-        txt.pack(fill="both", expand=True, padx=8, pady=6)
-        txt.insert("1.0", "Confidential\nSocial Security\n\\b\\d{3}-\\d{2}-\\d{4}\\b\n")
+        bl.addWidget(_muted_label(
+            "Enter one term per line. Regex supported when enabled.", dlg.body))
 
-        use_regex = tk.BooleanVar(value=True)
-        case_sens = tk.BooleanVar(value=False)
-        include_scope = tk.StringVar(value="all")
+        txt = QTextEdit(dlg.body)
+        txt.setFont(QFont("Consolas", 10))
+        txt.setStyleSheet(
+            f"background: {C['elevated']}; color: {C['fg']};"
+            f" border: 1px solid {C['border']}; border-radius: 4px; padding: 6px;"
+        )
+        txt.setPlainText("Confidential\nSocial Security\n\\b\\d{3}-\\d{2}-\\d{4}\\b\n")
+        bl.addWidget(txt)
 
-        s = section(body, "Options")
-        themed_check(s, "Use regex patterns", use_regex).pack(anchor="w")
-        themed_check(s, "Case sensitive", case_sens).pack(anchor="w")
+        use_regex_v = _Var(value=True)
+        case_v      = _Var(value=False)
+        scope_v     = _Var(value="all")
 
-        s2 = section(body, "Scope")
-        sc = tk.Frame(s2, bg=C["panel"])
-        sc.pack(anchor="w")
+        s = section(bl, "Options")
+        s._inner.addWidget(themed_check(s, "Use regex patterns", use_regex_v))
+        s._inner.addWidget(themed_check(s, "Case sensitive", case_v))
+
+        s2 = section(bl, "Scope")
+        sc_row = QHBoxLayout()
         for v, label in [("all", "All pages"), ("included", "Included only")]:
-            themed_radio(sc, label, include_scope, v).pack(side="left", padx=4)
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=(10, 0))
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Cancel", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
+            sc_row.addWidget(themed_radio(s2, label, scope_v, v))
+        s2._inner.addLayout(sc_row)
 
         def _run():
-            terms = [t for t in txt.get("1.0", "end").splitlines() if t.strip()]
+            terms = [t for t in txt.toPlainText().splitlines() if t.strip()]
             if not terms:
                 _toast(self, "Add at least one term", "warn")
                 return
@@ -228,13 +355,12 @@ class PDFFeatures:
                 filetypes=[("PDF files", "*.pdf")])
             if not out:
                 return
-            win.destroy()
-            self._run_keyword_redact(terms, bool(use_regex.get()),
-                                     bool(case_sens.get()),
-                                     include_scope.get(), out)
+            dlg.accept()
+            self._run_keyword_redact(terms, bool(use_regex_v.get()),
+                                     bool(case_v.get()), scope_v.get(), out)
 
-        themed_button(btns, "Redact & Save", style="accent",
-                      command=_run).pack(side="left", padx=4)
+        bl.addLayout(_btn_row(dlg.body, dlg.reject, "Redact & Save", _run))
+        dlg.exec()
 
     def _run_keyword_redact(self, terms, use_regex, case_sens, scope, out):
         path = _current_pdf_path(self)
@@ -257,12 +383,9 @@ class PDFFeatures:
                         except re.error:
                             continue
                         for m in pat.finditer(page_text):
-                            for r in page.search_for(m.group(0),
-                                                      quads=False):
-                                rects.append(r)
+                            rects.extend(page.search_for(m.group(0), quads=False))
                     else:
-                        for r in page.search_for(term):
-                            rects.append(r)
+                        rects.extend(page.search_for(term))
                 for r in rects:
                     page.add_redact_annot(r, fill=(0, 0, 0))
                     total += 1
@@ -270,135 +393,87 @@ class PDFFeatures:
                     page.apply_redactions()
             doc.save(out)
             doc.close()
-            _toast(self, f"Redacted {total} matches → {os.path.basename(out)}",
-                   "success")
+            _toast(self, f"Redacted {total} matches → {os.path.basename(out)}", "success")
         except Exception as e:
             messagebox.showerror("Redaction error", str(e))
 
     # ══════════════════════════════════════════════════════════════════════
-    # 3. SIGNATURE TOOL (draw → save → stamp)
+    # 3. SIGNATURE TOOL
     # ══════════════════════════════════════════════════════════════════════
     def signature_dialog(self):
         if not getattr(self, "pages", None):
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Signature Tool", 640, 460,
-                              resizable=(False, False))
-        body = win.body
 
-        tk.Label(body, text="Draw your signature below:",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 10)).pack(anchor="w")
+        dlg = themed_dialog(self, "Signature Tool", 640, 500)
+        bl = dlg.body_layout
 
-        cv = tk.Canvas(body, width=560, height=180, bg="#FFFFFF",
-                       highlightthickness=1, highlightbackground=C["border"],
-                       cursor="pencil")
-        cv.pack(pady=10)
+        bl.addWidget(_muted_label("Draw your signature below:", dlg.body))
 
-        pen_size = tk.IntVar(value=3)
-        color = tk.StringVar(value="#0A1F3D")
+        canvas = _SignatureCanvas(560, 180, dlg.body)
+        bl.addWidget(canvas)
 
-        strokes = []
+        pen_v   = _Var(value=3)
+        color_v = _Var(value="#0A1F3D")
 
-        def on_down(e):
-            strokes.append([(e.x, e.y)])
-
-        def on_move(e):
-            if not strokes:
-                return
-            strokes[-1].append((e.x, e.y))
-            x0, y0 = strokes[-1][-2]
-            cv.create_line(x0, y0, e.x, e.y, width=pen_size.get(),
-                           fill=color.get(),
-                           capstyle="round", smooth=True)
-
-        cv.bind("<Button-1>", on_down)
-        cv.bind("<B1-Motion>", on_move)
-
-        ctrl = tk.Frame(body, bg=C["panel"])
-        ctrl.pack(fill="x", pady=6)
-        tk.Label(ctrl, text="Pen:", bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 9)).pack(side="left", padx=(0, 6))
-        tk.Scale(ctrl, from_=1, to=10, variable=pen_size, orient="horizontal",
-                 showvalue=False, length=120, bg=C["panel"],
-                 troughcolor=C["elevated"], fg=C["fg"],
-                 activebackground=C["accent"],
-                 highlightthickness=0, bd=0).pack(side="left")
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(_muted_label("Pen size:", dlg.body))
+        slider = themed_scale(dlg.body, pen_v, from_=1, to=10)
+        slider.valueChanged.connect(canvas.set_pen_size)
+        ctrl.addWidget(slider)
 
         def pick_color():
-            c = colorchooser.askcolor(color=color.get(), parent=win)
+            c = colorchooser.askcolor(color=color_v.get(), parent=dlg)
             if c and c[1]:
-                color.set(c[1])
-        themed_button(ctrl, "Color", pick_color, style="solid"
-                      ).pack(side="left", padx=8)
+                color_v.set(c[1])
+                canvas.set_pen_color(c[1])
 
-        def clear():
-            cv.delete("all")
-            strokes.clear()
-        themed_button(ctrl, "Clear", clear, style="ghost"
-                      ).pack(side="left", padx=8)
+        ctrl.addWidget(themed_button(dlg.body, "Color", pick_color, style="solid"))
+        ctrl.addWidget(themed_button(dlg.body, "Clear", canvas.clear, style="ghost"))
+        ctrl.addStretch()
+        bl.addLayout(ctrl)
 
-        page_var = tk.IntVar(value=max(1, self._preview_index + 1
-                                       if self._preview_index >= 0 else 1))
-        x_var = tk.DoubleVar(value=0.65)
-        y_var = tk.DoubleVar(value=0.82)
-        w_var = tk.DoubleVar(value=0.25)
+        page_v = _Var(value=max(1, self._preview_index + 1
+                                if self._preview_index >= 0 else 1))
+        x_v = _Var(value=0.65)
+        y_v = _Var(value=0.82)
+        w_v = _Var(value=0.25)
 
-        s = section(body, "Placement")
-        pr = tk.Frame(s, bg=C["panel"])
-        pr.pack(anchor="w")
-        tk.Label(pr, text="Page:", bg=C["panel"], fg=C["fg_muted"]
-                 ).pack(side="left")
-        tk.Spinbox(pr, from_=1, to=max(1, len(self.pages)),
-                   textvariable=page_var, width=5,
-                   bg=C["elevated"], fg=C["fg"], bd=0).pack(side="left", padx=4)
-        for lbl, v in [("X:", x_var), ("Y:", y_var), ("W:", w_var)]:
-            tk.Label(pr, text=lbl, bg=C["panel"], fg=C["fg_muted"]
-                     ).pack(side="left", padx=(8, 2))
-            themed_entry(pr, textvariable=v, width=5).pack(side="left")
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=(10, 0))
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
+        s = section(bl, "Placement")
+        pr = QHBoxLayout()
+        pr.addWidget(_muted_label("Page:", s))
+        pr.addWidget(themed_spin(s, page_v, from_=1, to=max(1, len(self.pages))))
+        for lbl, v in [("X:", x_v), ("Y:", y_v), ("W:", w_v)]:
+            pr.addWidget(_muted_label(lbl, s))
+            pr.addWidget(themed_entry(s, var=v, width=5))
+        pr.addStretch()
+        s._inner.addLayout(pr)
 
         def apply_sig():
-            if not strokes:
+            if not canvas.has_strokes():
                 _toast(self, "Please draw a signature first", "warn")
                 return
-            # Render canvas strokes into a PIL image
-            img = Image.new("RGBA", (560, 180), (255, 255, 255, 0))
-            d = ImageDraw.Draw(img)
-            col = color.get().lstrip("#")
-            rgb = tuple(int(col[i:i+2], 16) for i in (0, 2, 4))
-            for stroke in strokes:
-                if len(stroke) < 2:
-                    continue
-                d.line(stroke, fill=(*rgb, 255), width=pen_size.get(),
-                       joint="curve")
-            # Save to temp file
+            img = canvas.render_to_pil()
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
             img.save(tmp.name)
-            # Inject as an annotation on the selected page
-            idx = page_var.get() - 1
+            idx = page_v.get() - 1
             if 0 <= idx < len(self.pages):
                 if hasattr(self, "_push_undo"):
                     self._push_undo("apply signature")
                 aspect = 180 / 560
                 self.pages[idx].annotations.append({
                     "type": "stamp", "image_path": tmp.name,
-                    "x": x_var.get(), "y": y_var.get(),
-                    "w": w_var.get(), "h": w_var.get() * aspect,
+                    "x": x_v.get(), "y": y_v.get(),
+                    "w": w_v.get(), "h": w_v.get() * aspect,
                 })
                 _toast(self,
                        f"Signature placed on page {idx + 1}  —  save PDF to commit",
                        "success")
-            win.destroy()
+            dlg.accept()
 
-        themed_button(btns, "Cancel", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
-        themed_button(btns, "Apply to page", apply_sig, style="accent"
-                      ).pack(side="left", padx=4)
+        bl.addLayout(_btn_row(dlg.body, dlg.reject, "Apply to page", apply_sig))
+        dlg.exec()
 
     # ══════════════════════════════════════════════════════════════════════
     # 4. HYPERLINK EDITOR
@@ -408,11 +483,10 @@ class PDFFeatures:
         if not path:
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Hyperlink Editor", 720, 480,
-                              resizable=(True, True))
-        body = win.body
 
-        # Build link list
+        dlg = themed_dialog(self, "Hyperlink Editor", 720, 500)
+        bl = dlg.body_layout
+
         doc = fitz.open(path)
         links = []
         for i, page in enumerate(doc):
@@ -425,65 +499,65 @@ class PDFFeatures:
                     "original": ln,
                 })
 
-        tk.Label(body,
-                 text=f"Found {len(links)} hyperlinks across {len(doc)} pages.",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 6))
+        bl.addWidget(_muted_label(
+            f"Found {len(links)} hyperlinks across {len(doc)} pages.", dlg.body))
 
-        cols = ("page", "type", "target")
-        tv = tk.ttk.Treeview(body, columns=cols, show="headings", height=12)
-        tv.heading("page", text="Page")
-        tv.heading("type", text="Type")
-        tv.heading("target", text="Target / URI")
-        tv.column("page", width=60, anchor="center")
-        tv.column("type", width=90)
-        tv.column("target", width=480)
-        tv.pack(fill="both", expand=True, pady=6)
-
+        tree = QTreeWidget(dlg.body)
+        tree.setHeaderLabels(["Page", "Type", "Target / URI"])
+        tree.setColumnWidth(0, 60)
+        tree.setColumnWidth(1, 90)
+        tree.setColumnWidth(2, 480)
+        tree.setStyleSheet(
+            f"QTreeWidget {{ background: {C['elevated']}; color: {C['fg']};"
+            f" border: 1px solid {C['border']}; }}"
+            f"QTreeWidget::item:selected {{ background: {C['accent']}; color: {C['fg_on_accent']}; }}"
+        )
         kinds = {1: "GOTO", 2: "URI", 3: "LAUNCH", 4: "GOTOR", 5: "NAMED"}
-        for i, ln in enumerate(links):
+        for ln in links:
             target = ln["uri"] if ln["uri"] else f"page {ln['original'].get('page', '?')}"
-            tv.insert("", "end", iid=str(i),
-                      values=(ln["page_index"] + 1,
-                              kinds.get(ln["kind"], "?"), target))
+            QTreeWidgetItem(tree, [
+                str(ln["page_index"] + 1),
+                kinds.get(ln["kind"], "?"),
+                target,
+            ])
+        bl.addWidget(tree)
 
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=6)
-
-        def _sel():
-            s = tv.selection()
-            if not s:
+        def _sel_link():
+            items = tree.selectedItems()
+            if not items:
                 return None
-            return links[int(s[0])]
+            return links[tree.indexOfTopLevelItem(items[0])]
 
         def edit_link():
-            ln = _sel()
+            ln = _sel_link()
             if not ln:
                 return
-            ask = simpledialog_string(
-                self.root, "Edit Hyperlink",
-                "New URI / page target:", ln["uri"])
+            ask = simpledialog.askstring(
+                "Edit Hyperlink", "New URI / page target:",
+                initialvalue=ln["uri"], parent=dlg)
             if ask is None:
                 return
             try:
                 page = doc[ln["page_index"]]
                 page.delete_link(ln["original"])
-                page.insert_link({
-                    "kind": 2, "from": ln["from"], "uri": ask,
-                })
-                tv.item(tv.selection()[0], values=(ln["page_index"] + 1,
-                                                   "URI", ask))
+                page.insert_link({"kind": 2, "from": ln["from"], "uri": ask})
+                items = tree.selectedItems()
+                if items:
+                    items[0].setText(2, ask)
+                    items[0].setText(1, "URI")
                 _toast(self, "Link updated", "success")
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
         def remove_link():
-            ln = _sel()
+            ln = _sel_link()
             if not ln:
                 return
             try:
                 doc[ln["page_index"]].delete_link(ln["original"])
-                tv.delete(tv.selection()[0])
+                items = tree.selectedItems()
+                if items:
+                    tree.takeTopLevelItem(tree.indexOfTopLevelItem(items[0]))
                 _toast(self, "Link removed", "info")
             except Exception as e:
                 messagebox.showerror("Error", str(e))
@@ -497,19 +571,19 @@ class PDFFeatures:
             try:
                 doc.save(out)
                 _toast(self, f"Saved → {os.path.basename(out)}", "success")
-                win.destroy()
+                dlg.accept()
             except Exception as e:
                 messagebox.showerror("Save error", str(e))
 
-        themed_button(btns, "Edit", edit_link, style="solid"
-                      ).pack(side="left", padx=4)
-        themed_button(btns, "Remove", remove_link, style="danger"
-                      ).pack(side="left", padx=4)
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Save PDF", save_pdf, style="accent"
-                      ).pack(side="left", padx=4)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(themed_button(dlg.body, "Edit",   edit_link,   style="solid"))
+        btn_row.addWidget(themed_button(dlg.body, "Remove", remove_link, style="danger"))
+        btn_row.addStretch()
+        btn_row.addWidget(themed_button(dlg.body, "Save PDF", save_pdf,  style="accent"))
+        bl.addLayout(btn_row)
 
-        win.protocol("WM_DELETE_WINDOW", lambda: (doc.close(), win.destroy()))
+        dlg.finished.connect(lambda _: doc.close())
+        dlg.exec()
 
     # ══════════════════════════════════════════════════════════════════════
     # 5. ATTACHMENT EXTRACTOR
@@ -519,51 +593,40 @@ class PDFFeatures:
         if not path:
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Attachment Extractor", 520, 400,
-                              resizable=(True, True))
-        body = win.body
+
+        dlg = themed_dialog(self, "Attachment Extractor", 520, 420)
+        bl = dlg.body_layout
 
         doc = fitz.open(path)
         n = doc.embfile_count()
-        tk.Label(body, text=f"{n} embedded attachment(s) found.",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 10)).pack(anchor="w")
+        bl.addWidget(_muted_label(f"{n} embedded attachment(s) found.", dlg.body))
 
-        lb = tk.Listbox(body, bg=C["elevated"], fg=C["fg"], bd=0,
-                        highlightthickness=1,
-                        highlightbackground=C["border"],
-                        selectbackground=C["accent"],
-                        selectforeground=C["fg_on_accent"],
-                        activestyle="none", font=("TkDefaultFont", 10),
-                        relief="flat", height=14)
-        lb.pack(fill="both", expand=True, pady=8)
-
+        lb = QListWidget(dlg.body)
+        lb.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        lb.setStyleSheet(
+            f"QListWidget {{ background: {C['elevated']}; color: {C['fg']};"
+            f" border: 1px solid {C['border']}; }}"
+            f"QListWidget::item:selected {{ background: {C['accent']}; color: {C['fg_on_accent']}; }}"
+        )
         names = []
         for i in range(n):
             info = doc.embfile_info(i)
             names.append(info["filename"])
-            size = info.get("size", 0)
-            lb.insert("end",
-                      f"  {info['filename']:<40}  {size/1024:.1f} KB")
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=6)
+            lb.addItem(f"  {info['filename']:<40}  {info.get('size', 0) / 1024:.1f} KB")
+        bl.addWidget(lb)
 
         def extract_selected():
-            sel = lb.curselection()
+            sel = [lb.row(item) for item in lb.selectedItems()]
             if not sel:
                 return
             out_dir = filedialog.askdirectory(title="Extract to folder")
             if not out_dir:
                 return
             for idx in sel:
-                name = names[idx]
                 data = doc.embfile_get(idx)
-                dest = os.path.join(out_dir, name)
-                with open(dest, "wb") as f:
+                with open(os.path.join(out_dir, names[idx]), "wb") as f:
                     f.write(data)
-            _toast(self,
-                   f"Extracted {len(sel)} file(s) to {out_dir}", "success")
+            _toast(self, f"Extracted {len(sel)} file(s) to {out_dir}", "success")
 
         def extract_all():
             if n == 0:
@@ -573,20 +636,21 @@ class PDFFeatures:
                 return
             for i in range(n):
                 data = doc.embfile_get(i)
-                dest = os.path.join(out_dir, names[i])
-                with open(dest, "wb") as f:
+                with open(os.path.join(out_dir, names[i]), "wb") as f:
                     f.write(data)
             _toast(self, f"Extracted {n} file(s)", "success")
 
-        themed_button(btns, "Extract selected", extract_selected,
-                      style="solid").pack(side="left", padx=4)
-        themed_button(btns, "Extract all", extract_all, style="accent"
-                      ).pack(side="left", padx=4)
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Close", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(themed_button(dlg.body, "Extract selected",
+                                        extract_selected, style="solid"))
+        btn_row.addWidget(themed_button(dlg.body, "Extract all",
+                                        extract_all, style="accent"))
+        btn_row.addStretch()
+        btn_row.addWidget(themed_button(dlg.body, "Close", dlg.accept, style="ghost"))
+        bl.addLayout(btn_row)
 
-        win.protocol("WM_DELETE_WINDOW", lambda: (doc.close(), win.destroy()))
+        dlg.finished.connect(lambda _: doc.close())
+        dlg.exec()
 
     # ══════════════════════════════════════════════════════════════════════
     # 6. TOC AUTO-GENERATOR
@@ -596,32 +660,39 @@ class PDFFeatures:
         if not path:
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Auto-generate TOC", 520, 520,
-                              resizable=(False, True))
-        body = win.body
 
-        tk.Label(body,
-                 text="Scan the PDF for headings and propose bookmarks.",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 10)).pack(anchor="w")
+        dlg = themed_dialog(self, "Auto-generate TOC", 520, 540)
+        bl = dlg.body_layout
 
-        min_size = tk.DoubleVar(value=14.0)
-        max_len = tk.IntVar(value=80)
+        bl.addWidget(_muted_label(
+            "Scan the PDF for headings and propose bookmarks.", dlg.body))
 
-        s = section(body, "Heuristic")
+        min_size_v = _Var(value=14.0)
+        max_len_v  = _Var(value=80)
+
+        s = section(bl, "Heuristic")
         field_row(s, "Min font size",
-                  themed_entry(s, textvariable=min_size, width=6),
+                  themed_entry(s, var=min_size_v, width=6),
                   "points (larger = fewer candidates)")
         field_row(s, "Max length",
-                  themed_entry(s, textvariable=max_len, width=6),
+                  themed_entry(s, var=max_len_v, width=6),
                   "chars (filters long paragraphs)")
 
-        # Scan
-        candidates = []
+        lb = QListWidget(dlg.body)
+        lb.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        lb.setFont(QFont("Consolas", 9))
+        lb.setStyleSheet(
+            f"QListWidget {{ background: {C['elevated']}; color: {C['fg']};"
+            f" border: 1px solid {C['border']}; }}"
+            f"QListWidget::item:selected {{ background: {C['accent']}; color: {C['fg_on_accent']}; }}"
+        )
+        bl.addWidget(lb)
+
+        candidates: list[dict] = []
 
         def scan():
             candidates.clear()
-            lb.delete(0, "end")
+            lb.clear()
             try:
                 doc = fitz.open(path)
                 for i, page in enumerate(doc):
@@ -630,17 +701,21 @@ class PDFFeatures:
                         for line in block.get("lines", []):
                             for sp in line.get("spans", []):
                                 text = sp["text"].strip()
-                                if (sp["size"] >= float(min_size.get()) and
-                                        3 <= len(text) <= int(max_len.get())
-                                        and not text.endswith(".")):
+                                try:
+                                    sz = float(min_size_v.get())
+                                    mx = int(max_len_v.get())
+                                except Exception:
+                                    sz, mx = 14.0, 80
+                                if (sp["size"] >= sz and
+                                        3 <= len(text) <= mx and
+                                        not text.endswith(".")):
                                     candidates.append({
                                         "title": text, "page": i,
                                         "size": sp["size"],
                                     })
-                                    lb.insert(
-                                        "end",
+                                    lb.addItem(
                                         f"  p.{i+1:<4}  {sp['size']:.0f}pt   {text[:60]}")
-                                    break  # one heading per line
+                                    break
                             else:
                                 continue
                             break
@@ -649,40 +724,28 @@ class PDFFeatures:
             except Exception as e:
                 messagebox.showerror("Scan error", str(e))
 
-        lb_wrap = tk.Frame(body, bg=C["elevated"],
-                           highlightthickness=1,
-                           highlightbackground=C["border"])
-        lb_wrap.pack(fill="both", expand=True, pady=8)
-        lb = tk.Listbox(lb_wrap, bg=C["elevated"], fg=C["fg"],
-                        bd=0, relief="flat", selectmode="extended",
-                        font=("TkFixedFont", 9),
-                        highlightthickness=0,
-                        selectbackground=C["accent"],
-                        selectforeground=C["fg_on_accent"])
-        lb.pack(fill="both", expand=True, padx=8, pady=8)
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=6)
-        themed_button(btns, "Scan", scan, style="solid"
-                      ).pack(side="left", padx=4)
-
         def add_bookmarks():
-            sel = lb.curselection() or list(range(lb.size()))
+            sel_items = lb.selectedItems()
+            indices = ([lb.row(it) for it in sel_items]
+                       if sel_items else list(range(lb.count())))
             count = 0
-            for i in sel:
+            for i in indices:
                 if i < len(candidates):
                     c = candidates[i]
-                    self._bookmarks.append(
-                        {"title": c["title"], "page": c["page"]})
+                    self._bookmarks.append({"title": c["title"], "page": c["page"]})
                     count += 1
             if hasattr(self, "refresh_bookmarks_sidebar"):
                 self.refresh_bookmarks_sidebar()
             _toast(self, f"Added {count} bookmarks", "success")
-            win.destroy()
+            dlg.accept()
 
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Add selected as bookmarks", add_bookmarks,
-                      style="accent").pack(side="left", padx=4)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(themed_button(dlg.body, "Scan", scan, style="solid"))
+        btn_row.addStretch()
+        btn_row.addWidget(themed_button(dlg.body, "Add selected as bookmarks",
+                                        add_bookmarks, style="accent"))
+        bl.addLayout(btn_row)
+        dlg.exec()
 
     # ══════════════════════════════════════════════════════════════════════
     # 7. MEASURING TOOL
@@ -691,89 +754,71 @@ class PDFFeatures:
         if not getattr(self, "pages", None):
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Measuring Tool", 720, 520,
-                              resizable=(True, True))
-        body = win.body
 
-        tk.Label(body,
-                 text="Click two points to measure distance. 1 unit = 1 point (72 pts = 1 inch).",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 10)).pack(anchor="w")
+        dlg = themed_dialog(self, "Measuring Tool", 720, 540)
+        bl = dlg.body_layout
 
-        scale = tk.DoubleVar(value=1.0)
-        unit = tk.StringVar(value="pt")
+        bl.addWidget(_muted_label(
+            "Click two points to measure distance. 1 unit = 1 point (72 pts = 1 inch).",
+            dlg.body))
 
-        ctl = tk.Frame(body, bg=C["panel"])
-        ctl.pack(fill="x", pady=4)
-        tk.Label(ctl, text="Scale: 1 pt =",
-                 bg=C["panel"], fg=C["fg_muted"]).pack(side="left")
-        themed_entry(ctl, textvariable=scale, width=6).pack(side="left", padx=4)
-        tk.Label(ctl, text="units", bg=C["panel"], fg=C["fg_muted"]
-                 ).pack(side="left", padx=(0, 8))
-        themed_entry(ctl, textvariable=unit, width=8).pack(side="left")
+        scale_v = _Var(value=1.0)
+        unit_v  = _Var(value="pt")
 
-        cv = tk.Canvas(body, bg=C["preview_bg"], highlightthickness=0, bd=0)
-        cv.pack(fill="both", expand=True, pady=8)
+        ctl = QHBoxLayout()
+        ctl.addWidget(_muted_label("Scale: 1 pt =", dlg.body))
+        ctl.addWidget(themed_entry(dlg.body, var=scale_v, width=6))
+        ctl.addWidget(_muted_label("units", dlg.body))
+        ctl.addWidget(themed_entry(dlg.body, var=unit_v, width=8))
+        ctl.addStretch()
+        bl.addLayout(ctl)
 
-        results = tk.Label(body, text="—",
-                           bg=C["panel"], fg=C["accent"],
-                           font=("TkFixedFont", 11, "bold"))
-        results.pack(anchor="w")
-
-        # Render current page into canvas
+        # Render current page
         idx = max(0, self._preview_index)
         rec = self.pages[idx]
         doc = fitz.open(rec.source_path)
         page = doc[rec.source_index]
         pix = page.get_pixmap(matrix=fitz.Matrix(1.3, 1.3), alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        tkimg = ImageTk.PhotoImage(img)
+        page_w = page.rect.width
         doc.close()
+        qpix = _fitz_pixmap_to_qpixmap(pix)
 
-        cv._img = tkimg
-        cv._pw = page.rect.width
-        cv._ph = page.rect.height
-        cv._ratio = pix.width / page.rect.width
+        canvas = _MeasureCanvas(qpix, page_w, dlg.body)
+        scroll = QScrollArea(dlg.body)
+        scroll.setWidget(canvas)
+        scroll.setWidgetResizable(False)
+        scroll.setStyleSheet(f"background: {C['preview_bg']}; border: none;")
+        bl.addWidget(scroll)
 
-        def redraw():
-            cv.delete("measure")
-            cv.delete("img")
-            cv.create_image(0, 0, image=tkimg, anchor="nw", tags=("img",))
+        result_lbl = QLabel("—", dlg.body)
+        result_lbl.setStyleSheet(
+            f"color: {C['accent']}; font-family: Consolas,monospace;"
+            f" font-size: 11px; font-weight: bold;")
+        bl.addWidget(result_lbl)
 
-        redraw()
+        def on_measure(dist_pt: float):
+            try:
+                s = float(scale_v.get())
+            except Exception:
+                s = 1.0
+            unit = unit_v.get() or "pt"
+            result_lbl.setText(
+                f"Distance: {dist_pt:.1f} pt   "
+                f"({dist_pt / 72:.2f} in   ·   "
+                f"{dist_pt * s:.2f} {unit})"
+            )
 
-        points = []
+        canvas.set_result_callback(on_measure)
 
-        def on_click(e):
-            points.append((e.x, e.y))
-            cv.create_oval(e.x - 4, e.y - 4, e.x + 4, e.y + 4,
-                           outline=C["accent"], width=2, tags=("measure",))
-            if len(points) == 2:
-                (x1, y1), (x2, y2) = points
-                cv.create_line(x1, y1, x2, y2, fill=C["accent"], width=2,
-                               tags=("measure",))
-                dx = (x2 - x1) / cv._ratio
-                dy = (y2 - y1) / cv._ratio
-                dist_pt = math.hypot(dx, dy)
-                try:
-                    s = float(scale.get())
-                except Exception:
-                    s = 1.0
-                results.config(
-                    text=(f"Distance: {dist_pt:.1f} pt   "
-                          f"({dist_pt / 72:.2f} in   ·   "
-                          f"{dist_pt * s:.2f} {unit.get()})"))
-                points.clear()
-
-        cv.bind("<Button-1>", on_click)
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=6)
-        themed_button(btns, "Reset", lambda: (redraw(), points.clear()),
-                      style="solid").pack(side="left", padx=4)
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Close", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(themed_button(
+            dlg.body, "Reset",
+            lambda: (canvas.reset(), result_lbl.setText("—")),
+            style="solid"))
+        btn_row.addStretch()
+        btn_row.addWidget(themed_button(dlg.body, "Close", dlg.accept, style="ghost"))
+        bl.addLayout(btn_row)
+        dlg.exec()
 
     # ══════════════════════════════════════════════════════════════════════
     # 8. AUTO-CROP (whitespace detection)
@@ -782,40 +827,35 @@ class PDFFeatures:
         if not getattr(self, "pages", None):
             _toast(self, "Open a PDF first", "warn")
             return
-        win = themed_toplevel(self.root, "Auto-Crop Whitespace", 420, 300)
-        body = win.body
 
-        threshold = tk.IntVar(value=240)
-        padding = tk.IntVar(value=8)
-        scope = tk.StringVar(value="all")
+        dlg = themed_dialog(self, "Auto-Crop Whitespace", 420, 320)
+        bl = dlg.body_layout
 
-        s = section(body, "Settings")
+        threshold_v = _Var(value=240)
+        padding_v   = _Var(value=8)
+        scope_v     = _Var(value="all")
+
+        s = section(bl, "Settings")
         field_row(s, "Brightness threshold",
-                  themed_entry(s, textvariable=threshold, width=6),
+                  themed_entry(s, var=threshold_v, width=6),
                   "0-255 (240 = near-white)")
         field_row(s, "Padding (points)",
-                  themed_entry(s, textvariable=padding, width=6),
+                  themed_entry(s, var=padding_v, width=6),
                   "margin to preserve")
 
-        s2 = section(body, "Scope")
-        sc = tk.Frame(s2, bg=C["panel"])
-        sc.pack(anchor="w")
+        s2 = section(bl, "Scope")
+        sc_row = QHBoxLayout()
         for v, label in [("all", "All pages"), ("included", "Included only")]:
-            themed_radio(sc, label, scope, v).pack(side="left", padx=4)
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=(16, 0))
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Cancel", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
+            sc_row.addWidget(themed_radio(s2, label, scope_v, v))
+        s2._inner.addLayout(sc_row)
 
         def _run():
-            win.destroy()
-            self._run_auto_crop(int(threshold.get()), int(padding.get()),
-                                scope.get())
+            dlg.accept()
+            self._run_auto_crop(
+                int(threshold_v.get()), int(padding_v.get()), scope_v.get())
 
-        themed_button(btns, "Detect & Apply", _run, style="accent"
-                      ).pack(side="left", padx=4)
+        bl.addLayout(_btn_row(dlg.body, dlg.reject, "Detect & Apply", _run))
+        dlg.exec()
 
     def _run_auto_crop(self, threshold, padding, scope):
         if hasattr(self, "_push_undo"):
@@ -829,32 +869,29 @@ class PDFFeatures:
             try:
                 doc = fitz.open(rec.source_path)
                 page = doc[rec.source_index]
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2),
-                                      alpha=False)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
                 img = Image.frombytes("RGB", [pix.width, pix.height],
                                       pix.samples).convert("L")
                 doc.close()
-                # binarise
-                bw = img.point(lambda p: 0 if p < threshold else 255)
+                bw  = img.point(lambda p: 0 if p < threshold else 255)
                 inv = Image.eval(bw, lambda p: 255 - p)
                 bbox = inv.getbbox()
                 if not bbox:
                     continue
                 left_px, t, right_px, b = bbox
-                sx = page.rect.width / pix.width
+                sx = page.rect.width  / pix.width
                 sy = page.rect.height / pix.height
                 rec.annotations.append({
-                    "type": "crop",
-                    "left": max(0, left_px * sx - padding),
-                    "top": max(0, t * sy - padding),
-                    "right": max(0, (pix.width - right_px) * sx - padding),
-                    "bottom": max(0, (pix.height - b) * sy - padding),
+                    "type":   "crop",
+                    "left":   max(0, left_px * sx - padding),
+                    "top":    max(0, t * sy - padding),
+                    "right":  max(0, (pix.width  - right_px) * sx - padding),
+                    "bottom": max(0, (pix.height - b)        * sy - padding),
                 })
                 applied += 1
             except Exception:
                 continue
-        _toast(self,
-               f"Auto-crop queued on {applied} page(s). Save PDF to apply.",
+        _toast(self, f"Auto-crop queued on {applied} page(s). Save PDF to apply.",
                "success")
 
     # ══════════════════════════════════════════════════════════════════════
@@ -867,56 +904,52 @@ class PDFFeatures:
             return
         try:
             reader = PdfReader(path)
-            fields = reader.get_form_text_fields() or {}
+            fields     = reader.get_form_text_fields() or {}
             all_fields = reader.get_fields() or {}
         except Exception as e:
             messagebox.showerror("Error", f"Could not read form: {e}")
             return
-
         if not all_fields:
             _toast(self, "No AcroForm fields found", "warn")
             return
 
-        win = themed_toplevel(self.root, "Form Fields", 560, 560,
-                              resizable=(True, True))
-        body = win.body
-        tk.Label(body,
-                 text=f"{len(all_fields)} form field(s). Edit values below:",
-                 bg=C["panel"], fg=C["fg_muted"],
-                 font=("TkDefaultFont", 10)).pack(anchor="w")
+        dlg = themed_dialog(self, "Form Fields", 560, 580)
+        bl = dlg.body_layout
 
-        scroll = tk.Canvas(body, bg=C["panel"], highlightthickness=0, bd=0)
-        scroll.pack(fill="both", expand=True, pady=6)
-        inner = tk.Frame(scroll, bg=C["panel"])
-        scroll.create_window((0, 0), window=inner, anchor="nw")
+        bl.addWidget(_muted_label(
+            f"{len(all_fields)} form field(s). Edit values below:", dlg.body))
 
-        vars_map = {}
-        for name, info in all_fields.items():
-            row = tk.Frame(inner, bg=C["panel"])
-            row.pack(fill="x", pady=3, padx=8)
-            tk.Label(row, text=name[:30], bg=C["panel"], fg=C["fg_muted"],
-                     font=("TkDefaultFont", 9), width=26, anchor="w"
-                     ).pack(side="left")
-            v = tk.StringVar(value=str(fields.get(name) or ""))
-            themed_entry(row, textvariable=v, width=36).pack(side="left",
-                                                             fill="x",
-                                                             expand=True)
+        scroll = QScrollArea(dlg.body)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background: {C['panel']}; border: none; }}"
+        )
+        inner = QWidget()
+        inner.setStyleSheet(f"background: {C['panel']};")
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setSpacing(4)
+        inner_layout.setContentsMargins(8, 8, 8, 8)
+        scroll.setWidget(inner)
+        bl.addWidget(scroll)
+
+        vars_map: dict[str, _Var] = {}
+        for name, _info in all_fields.items():
+            row_w = QWidget(inner)
+            row_w.setStyleSheet(f"background: {C['panel']};")
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            name_lbl = QLabel(name[:30], row_w)
+            name_lbl.setStyleSheet(f"color: {C['fg_muted']}; min-width: 180px;")
+            v = _Var(value=str(fields.get(name) or ""))
+            edit = themed_entry(row_w, var=v, width=36)
+            row_l.addWidget(name_lbl)
+            row_l.addWidget(edit)
+            inner_layout.addWidget(row_w)
             vars_map[name] = v
 
-        def _update_scroll(_=None):
-            inner.update_idletasks()
-            scroll.configure(scrollregion=scroll.bbox("all"))
-        inner.bind("<Configure>", _update_scroll)
-
-        flatten = tk.BooleanVar(value=True)
-        themed_check(body, "Flatten fields into content (read-only)",
-                     flatten).pack(anchor="w", pady=6)
-
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=6)
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Cancel", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
+        flatten_v = _Var(value=True)
+        bl.addWidget(themed_check(
+            dlg.body, "Flatten fields into content (read-only)", flatten_v))
 
         def save():
             out = filedialog.asksaveasfilename(
@@ -929,13 +962,12 @@ class PDFFeatures:
                 values = {k: v.get() for k, v in vars_map.items()}
                 for page in writer.pages:
                     writer.update_page_form_field_values(page, values)
-                if flatten.get():
-                    # Flatten via re-writing readonly flags
+                if flatten_v.get():
                     try:
                         from pypdf.generic import BooleanObject, NumberObject
                         if "/AcroForm" in writer._root_object:
-                            writer._root_object["/AcroForm"].update({
-                                "/NeedAppearances": BooleanObject(True)})
+                            writer._root_object["/AcroForm"].update(
+                                {"/NeedAppearances": BooleanObject(True)})
                         for page in writer.pages:
                             if "/Annots" in page:
                                 for annot in page["/Annots"]:
@@ -945,75 +977,78 @@ class PDFFeatures:
                         pass
                 with open(out, "wb") as f:
                     writer.write(f)
-                _toast(self,
-                       f"Saved → {os.path.basename(out)}", "success")
-                win.destroy()
+                _toast(self, f"Saved → {os.path.basename(out)}", "success")
+                dlg.accept()
             except Exception as e:
                 messagebox.showerror("Save error", str(e))
 
-        themed_button(btns, "Save", save, style="accent"
-                      ).pack(side="left", padx=4)
+        bl.addLayout(_btn_row(dlg.body, dlg.reject, "Save", save))
+        dlg.exec()
 
     # ══════════════════════════════════════════════════════════════════════
     # 10. MARKUPS (highlight / underline / strikeout / sticky note)
     # ══════════════════════════════════════════════════════════════════════
-    def markup_dialog(self, kind="highlight"):
+    def markup_dialog(self, kind: str = "highlight"):
         path = _current_pdf_path(self)
         if not path:
             _toast(self, "Open a PDF first", "warn")
             return
-        label_map = {"highlight": "Highlight Text",
-                     "underline": "Underline Text",
-                     "strikeout": "Strike-through Text",
-                     "note": "Sticky Note"}
-        win = themed_toplevel(self.root, label_map.get(kind, "Markup"),
-                              460, 360)
-        body = win.body
 
-        text_v = tk.StringVar()
-        content_v = tk.StringVar()
-        scope_v = tk.StringVar(value="all")
-        color_v = tk.StringVar(
-            value={"highlight": "#FFEA00",
-                   "underline": "#2563EB",
-                   "strikeout": "#DC2626",
-                   "note": "#F59E0B"}[kind])
+        label_map = {
+            "highlight": "Highlight Text",
+            "underline":  "Underline Text",
+            "strikeout":  "Strike-through Text",
+            "note":       "Sticky Note",
+        }
+        default_colors = {
+            "highlight": "#FFEA00",
+            "underline":  "#2563EB",
+            "strikeout":  "#DC2626",
+            "note":       "#F59E0B",
+        }
 
-        field_row(body, "Search term",
-                  themed_entry(body, textvariable=text_v, width=28))
+        dlg = themed_dialog(self, label_map.get(kind, "Markup"), 460, 380)
+        bl = dlg.body_layout
+
+        text_v    = _Var(value="")
+        content_v = _Var(value="")
+        scope_v   = _Var(value="all")
+        color_v   = _Var(value=default_colors.get(kind, "#FFEA00"))
+
+        field_row(dlg.body, "Search term",
+                  themed_entry(dlg.body, var=text_v, width=28))
         if kind == "note":
-            field_row(body, "Note content",
-                      themed_entry(body, textvariable=content_v, width=28))
+            field_row(dlg.body, "Note content",
+                      themed_entry(dlg.body, var=content_v, width=28))
 
-        s = section(body, "Scope")
-        sc = tk.Frame(s, bg=C["panel"])
-        sc.pack(anchor="w")
+        s = section(bl, "Scope")
+        sc_row = QHBoxLayout()
         for v, label in [("all", "All pages"), ("included", "Included only")]:
-            themed_radio(sc, label, scope_v, v).pack(side="left", padx=4)
+            sc_row.addWidget(themed_radio(s, label, scope_v, v))
+        s._inner.addLayout(sc_row)
 
-        s2 = section(body, "Color")
-        colorrow = tk.Frame(s2, bg=C["panel"])
-        colorrow.pack(anchor="w")
-        col_btn = tk.Label(colorrow, bg=color_v.get(), width=6, height=2,
-                           cursor="hand2",
-                           highlightthickness=1,
-                           highlightbackground=C["border"])
-        col_btn.pack(side="left", padx=(0, 10))
+        s2 = section(bl, "Color")
+        col_row = QHBoxLayout()
+        col_btn = QPushButton(s2)
+        col_btn.setFixedSize(50, 28)
+        col_btn.setStyleSheet(
+            f"background: {color_v.get()}; border: 1px solid {C['border']};"
+            f" border-radius: 4px;"
+        )
 
         def pick():
-            c = colorchooser.askcolor(color=color_v.get(), parent=win)
+            c = colorchooser.askcolor(color=color_v.get(), parent=dlg)
             if c and c[1]:
                 color_v.set(c[1])
-                col_btn.configure(bg=c[1])
-        col_btn.bind("<Button-1>", lambda _e: pick())
-        themed_button(colorrow, "Pick color", pick,
-                      style="solid").pack(side="left")
+                col_btn.setStyleSheet(
+                    f"background: {c[1]}; border: 1px solid {C['border']};"
+                    f" border-radius: 4px;")
 
-        btns = tk.Frame(body, bg=C["panel"])
-        btns.pack(fill="x", pady=(16, 0))
-        tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-        themed_button(btns, "Cancel", win.destroy, style="ghost"
-                      ).pack(side="left", padx=4)
+        col_btn.clicked.connect(pick)
+        col_row.addWidget(col_btn)
+        col_row.addWidget(themed_button(s2, "Pick color", pick, style="solid"))
+        col_row.addStretch()
+        s2._inner.addLayout(col_row)
 
         def _run():
             term = text_v.get().strip()
@@ -1025,37 +1060,34 @@ class PDFFeatures:
                 filetypes=[("PDF files", "*.pdf")])
             if not out:
                 return
-            win.destroy()
-            self._run_markup(kind, term, content_v.get(), color_v.get(),
-                             scope_v.get(), out)
+            dlg.accept()
+            self._run_markup(kind, term, content_v.get(),
+                             color_v.get(), scope_v.get(), out)
 
-        themed_button(btns, "Apply & Save", _run, style="accent"
-                      ).pack(side="left", padx=4)
+        bl.addLayout(_btn_row(dlg.body, dlg.reject, "Apply & Save", _run))
+        dlg.exec()
 
     def _run_markup(self, kind, term, note_content, color_hex, scope, out):
         path = _current_pdf_path(self)
         try:
             doc = fitz.open(path)
             col_hex = color_hex.lstrip("#")
-            rgb = tuple(int(col_hex[i:i+2], 16) / 255 for i in (0, 2, 4))
+            rgb = tuple(int(col_hex[i:i + 2], 16) / 255 for i in (0, 2, 4))
             added = 0
             for i, page in enumerate(doc):
                 rec = self.pages[i] if i < len(self.pages) else None
                 if scope == "included" and rec and not rec.included.get():
                     continue
                 if kind == "note":
-                    # place a sticky note in the top-left
-                    page.add_text_annot(
-                        fitz.Point(40, 40), note_content or "Note")
+                    page.add_text_annot(fitz.Point(40, 40), note_content or "Note")
                     added += 1
                 else:
-                    rects = page.search_for(term) if term else []
-                    for rect in rects:
+                    for rect in (page.search_for(term) if term else []):
                         if kind == "highlight":
                             a = page.add_highlight_annot(rect)
                         elif kind == "underline":
                             a = page.add_underline_annot(rect)
-                        else:  # strikeout
+                        else:
                             a = page.add_strikeout_annot(rect)
                         try:
                             a.set_colors(stroke=rgb)
@@ -1065,47 +1097,9 @@ class PDFFeatures:
                         added += 1
             doc.save(out)
             doc.close()
-            _toast(self,
-                   f"Added {added} markup(s) → {os.path.basename(out)}",
-                   "success")
+            _toast(self, f"Added {added} markup(s) → {os.path.basename(out)}", "success")
         except Exception as e:
             messagebox.showerror("Markup error", str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  themed string input (used by hyperlink editor)
-# ─────────────────────────────────────────────────────────────────────────────
-def simpledialog_string(root, title, prompt, initial=""):
-    import queue
-    q = queue.Queue()
-    win = themed_toplevel(root, title, 400, 180)
-    body = win.body
-    tk.Label(body, text=prompt, bg=C["panel"], fg=C["fg"],
-             font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 6))
-    var = tk.StringVar(value=initial)
-    themed_entry(body, textvariable=var, width=40).pack(fill="x")
-    btns = tk.Frame(body, bg=C["panel"])
-    btns.pack(fill="x", pady=(14, 0))
-    tk.Frame(btns, bg=C["panel"]).pack(side="left", fill="x", expand=True)
-
-    def ok():
-        q.put(var.get())
-        win.destroy()
-
-    def cancel():
-        q.put(None)
-        win.destroy()
-
-    themed_button(btns, "Cancel", cancel, style="ghost"
-                  ).pack(side="left", padx=4)
-    themed_button(btns, "OK", ok, style="accent"
-                  ).pack(side="left", padx=4)
-    win.protocol("WM_DELETE_WINDOW", cancel)
-    win.wait_window()
-    try:
-        return q.get_nowait()
-    except Exception:
-        return None
 
 
 __all__ = ["PDFFeatures"]
