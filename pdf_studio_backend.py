@@ -202,6 +202,10 @@ class PDFStudioBase:
         self._bookmarks  = []
         self.progress    = _ProgressStub()
 
+        # Hold references to background threads so Python GC doesn't destroy them
+        self._pdf_load_worker = None
+        self._pdf_load_thread = None
+
         self._build_ui()
         self._bind_keys()
         if SESSION_PERSISTENCE:
@@ -687,12 +691,22 @@ class PDFStudioBase:
         worker = _PDFLoadWorker(path, password)
         thread = QThread()
         worker.moveToThread(thread)
+
+        # Keep Python references so GC doesn't destroy them while running
+        self._pdf_load_worker = worker
+        self._pdf_load_thread = thread
+
+        def _cleanup():
+            self._pdf_load_worker = None
+            self._pdf_load_thread = None
+
         thread.started.connect(worker.run)
         worker.finished.connect(
             lambda recs, meta, err: self._on_pdf_loaded(
                 recs, meta, err, path, replace, insert_after))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(_cleanup)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 

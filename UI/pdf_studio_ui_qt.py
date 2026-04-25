@@ -706,6 +706,7 @@ class PDFStudioUI(QMainWindow):
         self._cards: list[_PageCard] = []
         self._selected_idx: int = -1
         self._dark_mode = True
+        self._thumb_workers: set = set()   # keeps QThread wrappers alive
 
         self.setWindowTitle("PDF Studio")
         self.setMinimumSize(1100, 660)
@@ -1263,7 +1264,7 @@ class PDFStudioUI(QMainWindow):
     # ── Thumbnail loading ────────────────────────────────────────────────────
 
     def _load_thumbnail(self, card: _PageCard):
-        """Load thumbnail in a thread and update the card when done."""
+        """Load thumbnail in a background QThread; keep a Python ref until done."""
         rec = card.rec
 
         class _ThumbWorker(QThread):
@@ -1282,8 +1283,14 @@ class PDFStudioUI(QMainWindow):
                     pass
 
         worker = _ThumbWorker(self)
+        self._thumb_workers.add(worker)          # prevent GC while running
+
+        def _cleanup():
+            self._thumb_workers.discard(worker)
+            worker.deleteLater()
+
         worker.done.connect(card.set_thumbnail)
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(_cleanup)
         worker.start()
 
     # ── Toast notifications ──────────────────────────────────────────────────
