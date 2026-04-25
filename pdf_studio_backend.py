@@ -39,7 +39,7 @@ from UI.pdf_studio_ui_qt import C as UI_C
 from UI.qt_compat import filedialog, messagebox, simpledialog, colorchooser
 
 from PySide6.QtWidgets import QMenu, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QCheckBox, QRadioButton, QSlider, QFrame, QApplication
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal as _Signal
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -51,6 +51,46 @@ class _ProgressStub:
     def stop(self, *a):  pass
     def grid(self, *a):  pass
     def grid_remove(self, *a): pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Background PDF loader  (keeps the UI thread free for large files)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _PDFLoadWorker(QObject):
+    """Reads pages + metadata from a PDF in a background QThread."""
+
+    # (records, metadata_dict, error_message)
+    finished = _Signal(list, dict, str)
+
+    def __init__(self, path: str, password: str | None = None):
+        super().__init__()
+        self._path     = path
+        self._password = password
+
+    def run(self):
+        try:
+            reader = PdfReader(self._path)
+            if reader.is_encrypted:
+                if not self._password:
+                    self.finished.emit([], {}, "__needs_password__")
+                    return
+                try:
+                    reader.decrypt(self._password)
+                except Exception:
+                    self.finished.emit([], {}, "__wrong_password__")
+                    return
+
+            records = []
+            for i in range(len(reader.pages)):
+                orient = get_page_orientation(reader.pages[i])
+                rec = PageRecord(self._path, i, _Var(value=orient))
+                records.append(rec)
+
+            meta = {k: v for k, v in (reader.metadata or {}).items()}
+            self.finished.emit(records, meta, "")
+        except Exception as exc:
+            self.finished.emit([], {}, str(exc))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -623,42 +663,68 @@ class PDFStudioBase:
         self._refresh_recent_menu()
 
     def _load_pdf(self, path, replace=False, insert_after=None, password=None):
+        """
+        Start loading *path* in a background thread so the UI stays responsive.
+        Encrypted files are detected first on the main thread so we can show
+        the password dialog before spawning the worker.
+        """
+        # Quick encryption check (cheap — just reads the header)
         try:
-            reader = PdfReader(path)
-            if reader.is_encrypted:
-                pwd = password or simpledialog.askstring(
-                    "Password", f"Enter password for:\n{os.path.basename(path)}", show="*")
-                if not pwd:
-                    return
-                try:
-                    reader.decrypt(pwd)
-                except Exception:
-                    messagebox.showerror("Error", "Wrong password.")
+            _probe = PdfReader(path)
+            if _probe.is_encrypted:
+                password = password or simpledialog.askstring(
+                    "Password", f"Enter password for:\n{os.path.basename(path)}",
+                    show="*")
+                if not password:
                     return
         except Exception as e:
             messagebox.showerror("Error", f"Could not read PDF:\n{e}")
             return
 
-        new_records = []
-        for i in range(len(reader.pages)):
-            orient = get_page_orientation(reader.pages[i])
-            rec = PageRecord(path, i, _Var(value=orient))
-            new_records.append(rec)
+        if hasattr(self, "_show_toast"):
+            self._show_toast("Loading…", "info", 60_000)   # long-lived; dismissed on completion
+
+        worker = _PDFLoadWorker(path, password)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            lambda recs, meta, err: self._on_pdf_loaded(
+                recs, meta, err, path, replace, insert_after))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_pdf_loaded(self, records, meta, error, path, replace, insert_after):
+        """Called on the main thread once the background loader finishes."""
+        # Dismiss the "Loading…" toast
+        if hasattr(self, "_show_toast"):
+            self._show_toast("", "info", 1)
+
+        if error == "__needs_password__":
+            messagebox.showerror("Encrypted", "This PDF requires a password.")
+            return
+        if error == "__wrong_password__":
+            messagebox.showerror("Wrong password", "Incorrect password — could not open PDF.")
+            return
+        if error:
+            messagebox.showerror("Error", f"Could not load PDF:\n{error}")
+            return
 
         if replace:
-            self.pages = new_records
-            meta = reader.metadata or {}
+            self.pages = records
             self.meta_title.set(meta.get("/Title", ""))
             self.meta_author.set(meta.get("/Author", ""))
             self.meta_subject.set(meta.get("/Subject", ""))
-            self._preview_index = 0 if new_records else -1
-            self._preview_rec = new_records[0] if new_records else None
+            self._preview_index = 0 if records else -1
+            self._preview_rec = records[0] if records else None
             self.undo_stack = UndoStack()
             self._update_undo_labels()
         elif insert_after is None:
-            self.pages.extend(new_records)
+            self.pages.extend(records)
         else:
-            self.pages[insert_after + 1:insert_after + 1] = new_records
+            self.pages[insert_after + 1:insert_after + 1] = records
 
         self.preview_cache.clear()
         self._rebuild_rows()
